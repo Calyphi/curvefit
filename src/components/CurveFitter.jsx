@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { Scatter, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ComposedChart } from "recharts";
 import ProModal from "./ProModal";
 
@@ -1272,12 +1272,12 @@ export default function CurveFitter() {
 
             {/* Custom Model */}
             <section className="bg-gray-900 rounded-lg p-3 border border-gray-800">
-              <h2 className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-2">Custom model <span className="text-gray-600 normal-case font-normal">(optional)</span></h2>
+              <h2 className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-2">Custom model <span className="text-gray-400 normal-case font-normal">(optional)</span></h2>
               <input type="text" value={customExpr} onChange={(e) => { setCustomExpr(e.target.value); setCustomError(null); }}
                 className="w-full bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 border border-gray-700 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                 placeholder="a * exp(-b * x) + c"
                 aria-label="Custom model equation" />
-              <p className="text-xs text-gray-600 mt-1">Use x as variable, a–z as parameters. Functions: exp, log, sin, cos, sqrt, pow. Rate constants in exp(−k·x) are auto-constrained positive.</p>
+              <p className="text-xs text-gray-400 mt-1">Use x as variable, a–z as parameters. Functions: exp, log, sin, cos, sqrt, pow. Rate constants in exp(−k·x) are auto-constrained positive.</p>
               {customError && <p className="text-xs text-red-400 mt-1" role="alert">✗ {customError}</p>}
             </section>
 
@@ -1329,7 +1329,7 @@ export default function CurveFitter() {
                           <span className={`font-mono text-xs ${r.adjR2 > 0.99 ? 'text-green-400' : r.adjR2 > 0.95 ? 'text-yellow-400' : r.adjR2 < 0 ? 'text-red-500' : 'text-gray-400'}`}>
                             {r.adjR2 < 0 ? `R²=${r.adjR2.toFixed(2)}` : `R²=${r.adjR2.toFixed(4)}`}
                           </span>
-                          <span className="font-mono text-gray-500 text-xs">{(r.akaikeWeight * 100).toFixed(0)}%</span>
+                          <span className="font-mono text-gray-400 text-xs">{(r.akaikeWeight * 100).toFixed(0)}%</span>
                         </div>
                       </div>
                     </button>
@@ -1484,7 +1484,7 @@ export default function CurveFitter() {
                             </td>
                           )}
                           {showCI && sel.ci95 && (
-                            <td className="py-1.5 text-right font-mono text-gray-500">
+                            <td className="py-1.5 text-right font-mono text-gray-400">
                               {isFinite(sel.ci95[i][0]) ? `[${fmt(sel.ci95[i][0])}, ${fmt(sel.ci95[i][1])}]` : "—"}
                             </td>
                           )}
@@ -1493,7 +1493,7 @@ export default function CurveFitter() {
                     </tbody>
                   </table>
                   {showCI && sel.stdErrors && (
-                    <p className="text-xs text-gray-500 mt-1.5 italic">
+                    <p className="text-xs text-gray-400 mt-1.5 italic">
                       Shaded bands show ≈95% confidence interval of the mean fit (analytical delta-method approximation).
                       {sel.dof < 8 && <span className="text-yellow-500 not-italic"> Low DOF ({sel.dof}) — uncertainties may be unreliable.</span>}
                     </p>

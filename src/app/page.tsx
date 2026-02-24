@@ -41,7 +41,7 @@ export default function LandingPage() {
           </a>
           <Link
             href="/app"
-            className="rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-cyan-500"
+            className="rounded-lg bg-cyan-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-cyan-600"
           >
             CurveFit
           </Link>
@@ -68,7 +68,7 @@ export default function LandingPage() {
             <div className="mt-10 flex flex-col items-center gap-4 sm:flex-row lg:justify-start">
               <Link
                 href="/app"
-                className="inline-flex items-center gap-2 rounded-xl bg-cyan-600 px-8 py-3.5 text-base font-semibold text-white shadow-lg shadow-cyan-600/25 transition hover:bg-cyan-500"
+                className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-8 py-3.5 text-base font-semibold text-white shadow-lg shadow-cyan-700/25 transition hover:bg-cyan-600"
               >
                 Open CurveFit — Free
               </Link>
@@ -145,7 +145,7 @@ export default function LandingPage() {
         </p>
         <Link
           href="/app"
-          className="mt-8 inline-flex items-center gap-2 rounded-xl bg-cyan-600 px-8 py-3.5 text-base font-semibold text-white shadow-lg shadow-cyan-600/25 transition hover:bg-cyan-500"
+          className="mt-8 inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-8 py-3.5 text-base font-semibold text-white shadow-lg shadow-cyan-700/25 transition hover:bg-cyan-600"
         >
           Open CurveFit — Free
         </Link>
