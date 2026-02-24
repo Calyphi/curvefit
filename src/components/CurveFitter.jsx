@@ -972,13 +972,65 @@ export default function CurveFitter() {
     setFitting(true); setFitProgress(0); setError(null); setCustomError(null);
     const models = buildModels(data.xData, data.yData);
 
-    // Inject custom model if provided
+    // Inject custom model if provided — smart init + multi-start
     if (customExpr.trim()) {
       const custom = parseCustomModel(customExpr);
       if (custom) {
-        // Smart initial guesses from data
-        const yRange = Math.max(...data.yData) - Math.min(...data.yData);
-        custom.init = custom.init.map(() => yRange > 0 ? yRange * 0.5 : 1);
+        const xd = data.xData, yd = data.yData, nd = xd.length;
+        const yMin_ = Math.min(...yd), yMax_ = Math.max(...yd);
+        const yMean_ = yd.reduce((s, y) => s + y, 0) / nd;
+        const yRange_ = yMax_ - yMin_;
+        const xMin_ = Math.min(...xd), xMax_ = Math.max(...xd);
+        const xRange_ = xMax_ - xMin_;
+
+        // Detect trig → estimate frequency via zero-crossing on detrended data
+        const exprLc = customExpr.toLowerCase();
+        const hasTrig = /\b(sin|cos)\b/.test(exprLc);
+        let estFreq = 2 * Math.PI / (xRange_ || 1);
+        if (hasTrig && nd >= 8) {
+          const xMean_ = xd.reduce((s, x) => s + x, 0) / nd;
+          let num = 0, den = 0;
+          for (let i = 0; i < nd; i++) { num += (xd[i] - xMean_) * (yd[i] - yMean_); den += (xd[i] - xMean_) ** 2; }
+          const slope = den > 0 ? num / den : 0;
+          const intercept = yMean_ - slope * xMean_;
+          const detrended = yd.map((y, i) => y - slope * xd[i] - intercept);
+          let crossings = 0;
+          for (let i = 1; i < nd; i++) { if (detrended[i] * detrended[i - 1] < 0) crossings++; }
+          if (crossings > 0) estFreq = Math.PI * crossings / xRange_;
+        }
+
+        // Role-aware initial guesses based on where param appears in expression
+        custom.init = custom.paramNames.map((pName) => {
+          // Frequency: param inside sin(...) or cos(...) parens only
+          const freqPat = new RegExp('(sin|cos)\\s*\\([^)]*\\b' + pName + '\\b');
+          if (freqPat.test(exprLc)) return estFreq;
+          // Amplitude: param multiplied by sin/cos result
+          const ampPat = new RegExp('\\b' + pName + '\\b\\s*\\*\\s*(sin|cos)|(sin|cos)\\s*\\([^)]*\\)\\s*\\*\\s*\\b' + pName + '\\b');
+          if (ampPat.test(exprLc)) return yRange_ / 2;
+          // Slope: param multiplied by x directly
+          const slopePat = new RegExp('\\b' + pName + '\\b\\s*\\*\\s*x|x\\s*\\*\\s*\\b' + pName + '\\b');
+          if (slopePat.test(exprLc)) return xRange_ > 0 ? yRange_ / xRange_ : 1;
+          // Default: offset → yMean
+          return Math.abs(yMean_) > 1e-10 ? yMean_ : 1;
+        });
+
+        // Multi-start: try smart init + 7 random perturbations, keep best
+        let bestInit = custom.init;
+        let bestAicc = Infinity;
+        for (let attempt = 0; attempt < 8; attempt++) {
+          const trialInit = custom.init.map((v, _i) => {
+            if (attempt === 0) return v;
+            return v * Math.pow(10, (Math.random() - 0.5) * 2);
+          });
+          try {
+            const r = levenbergMarquardt(custom.func, xd, yd, trialInit, { positiveIdx: custom.positiveIdx || [] });
+            if (isFinite(r.aicc) && r.aicc < bestAicc && r.finalInvalidCount === 0) {
+              bestAicc = r.aicc;
+              bestInit = trialInit;
+            }
+          } catch {}
+        }
+        custom.init = bestInit;
         models.push(custom);
       } else {
         setCustomError("Could not parse expression. Use: a * exp(-b * x) + c");
