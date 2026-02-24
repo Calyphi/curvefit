@@ -479,17 +479,6 @@ function buildModels(xData, yData) {
     (x, p, E) => p[0] / (1 + (E || safeExp)(-p[1] * (x - p[2]))),
     seed, ["L", "k", "x₀"], [0, 1]));
 
-  // 4-param Logistic with offset (most common real-world sigmoid)
-  const log4Seeds = [
-    [yRange, 4 / xRange, xMean, yMin],
-    [yRange * 0.8, 2 / xRange, xAtY((yMax + yMin) / 2), yMin],
-    [yMax, 8 / xRange, xMean + xRange * 0.1, yMin * 0.5],
-  ];
-  log4Seeds.forEach((seed, si) => add("Logistic4", si === 0 ? "Logistic + offset" : `Logistic + offset (seed ${si + 1})`,
-    "y = L / (1 + exp(−k·(x − x₀))) + d", 4,
-    (x, p, E) => p[0] / (1 + (E || safeExp)(-p[1] * (x - p[2]))) + p[3],
-    seed, ["L", "k", "x₀", "d"], [0, 1]));
-
   // Gaussian (multi-start)
   const gSeeds = [
     [yRange, xData[iMax] || xMean, xRange / 4, yMin],
@@ -625,6 +614,31 @@ function buildModels(xData, yData) {
     "y = a·sin(ω·x + φ) + d", 4,
     (x, p) => p[0] * Math.sin(p[1] * x + p[2]) + p[3],
     seed, ["a", "ω", "φ", "d"], [0, 1]));
+
+  // Auto-generate "+d" offset variants for models that don't have one
+  const familiesWithOffset = new Set([
+    'Linear', 'Quadratic', 'Cubic', 'ExpDecay', 'Gaussian', '4PL', '5PL',
+    'Reciprocal', 'BiExp', 'Lorentzian', 'Sine', 'Logarithmic', 'KWW', 'Custom',
+  ]);
+  const seenFamilies = new Set();
+  const offsetModels = [];
+  for (const m of models) {
+    if (familiesWithOffset.has(m.family)) continue;
+    if (seenFamilies.has(m.family)) continue;
+    seenFamilies.add(m.family);
+    const origFunc = m.func;
+    offsetModels.push({
+      family: m.family + '_offset',
+      name: m.name + ' + offset',
+      equation: m.equation + ' + d',
+      nParams: m.nParams + 1,
+      func: (x, p, E) => origFunc(x, p.slice(0, -1), E) + p[p.length - 1],
+      init: [...m.init, yMin],
+      paramNames: [...m.paramNames, 'd'],
+      positiveIdx: m.positiveIdx || [],
+    });
+  }
+  models.push(...offsetModels);
 
   return models;
 }
@@ -1287,7 +1301,6 @@ export default function CurveFitter() {
     'BiExp': 'Two decay components (fast + slow). Parameters (a₁,k₁) and (a₂,k₂) are interchangeable — CIs may be inflated due to this symmetry.',
     'Gompertz': 'Asymmetric sigmoid — unlike Logistic, the inflection point is not at the midpoint.',
     'Lorentzian': 'Cauchy peak profile — heavier tails than Gaussian. Common in spectroscopy (NMR, XRD).',
-    'Logistic4': 'Logistic sigmoid with vertical offset — use when baseline is not zero.',
     'Custom': 'User-defined equation — fitted with multi-start (8 seeds). Rate params in exp(-k·x) auto-detected as positive.',
   };
 
@@ -1568,11 +1581,17 @@ export default function CurveFitter() {
                 </div>
 
                 {/* Model note */}
-                {MODEL_NOTES[sel.family] && (
-                  <div className="text-xs text-blue-400/80 bg-blue-500/10 rounded px-2 py-1.5 mb-3">
-                    ℹ {MODEL_NOTES[sel.family]}
-                  </div>
-                )}
+                {(() => {
+                  const note = MODEL_NOTES[sel.family]
+                    || (sel.family.endsWith('_offset') && (MODEL_NOTES[sel.family.replace('_offset', '')]
+                      ? MODEL_NOTES[sel.family.replace('_offset', '')] + ' With vertical offset for non-zero baseline.'
+                      : 'Offset variant — adds vertical shift for data with non-zero baseline.'));
+                  return note ? (
+                    <div className="text-xs text-blue-400/80 bg-blue-500/10 rounded px-2 py-1.5 mb-3">
+                      ℹ {note}
+                    </div>
+                  ) : null;
+                })()}
 
                 {/* Parameters with CI */}
                 <div className="overflow-x-auto">
