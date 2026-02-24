@@ -1163,6 +1163,43 @@ export default function CurveFitter() {
 
   const fmt = (v) => { if (!isFinite(v)) return "—"; if (Math.abs(v) < 0.001 || Math.abs(v) > 99999) return v.toExponential(4); return v.toPrecision(6); };
 
+  // Nice tick computation for clean axis labels (linear mode only)
+  const niceTicks = (dMin, dMax, count = 5) => {
+    if (!isFinite(dMin) || !isFinite(dMax) || dMin === dMax) {
+      return dMin === dMax && isFinite(dMin) ? [dMin] : [];
+    }
+    const range = dMax - dMin;
+    const rawStep = range / count;
+    const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+    const residual = rawStep / mag;
+    let niceStep;
+    if (residual < 1.5) niceStep = 1 * mag;
+    else if (residual < 3) niceStep = 2 * mag;
+    else if (residual < 7) niceStep = 5 * mag;
+    else niceStep = 10 * mag;
+    const iLo = Math.floor(dMin / niceStep);
+    const iHi = Math.ceil(dMax / niceStep);
+    const ticks = [];
+    for (let i = iLo; i <= iHi; i++) {
+      ticks.push(parseFloat((i * niceStep).toPrecision(12)));
+    }
+    return ticks;
+  };
+
+  const linearTickFmt = (v) => parseFloat(v.toPrecision(6));
+
+  // Precompute nice ticks for linear axes
+  const axisTicks = useMemo(() => {
+    if (!data) return { x: undefined, y: undefined };
+    const xs = data.xData, ys = data.yData;
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    return {
+      x: logX ? undefined : niceTicks(xMin, xMax, 5),
+      y: logY ? undefined : niceTicks(yMin, yMax, 5),
+    };
+  }, [data, logX, logY]);
+
   const copyParams = (model) => {
     const lines = model.paramNames.map((n, i) => {
       const se = model.stdErrors && isFinite(model.stdErrors[i]) ? ` ± ${fmt(model.stdErrors[i])}` : '';
@@ -1361,14 +1398,18 @@ export default function CurveFitter() {
                     <ComposedChart margin={{ top: 10, right: 20, bottom: 40, left: 20 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                       <XAxis dataKey="x" type="number" stroke="#9CA3AF" tick={{ fontSize: 11 }}
-                        scale={logX ? "log" : "auto"} domain={chartDataMemo.xDomain || ['auto', 'auto']}
+                        scale={logX ? "log" : "auto"}
+                        domain={logX ? (chartDataMemo.xDomain || ['auto', 'auto']) : axisTicks.x ? [axisTicks.x[0], axisTicks.x[axisTicks.x.length - 1]] : ['auto', 'auto']}
+                        ticks={logX ? undefined : axisTicks.x}
                         allowDataOverflow
-                        tickFormatter={logX ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : undefined}
+                        tickFormatter={logX ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : linearTickFmt}
                         label={{ value: data?.headers[0] || 'x', position: 'bottom', offset: 20, fill: '#9CA3AF', fontSize: 12 }} />
                       <YAxis stroke="#9CA3AF" tick={{ fontSize: 11 }}
-                        scale={logY ? "log" : "auto"} domain={logY ? ['auto', 'auto'] : ['auto', 'auto']}
+                        scale={logY ? "log" : "auto"}
+                        domain={logY ? ['auto', 'auto'] : axisTicks.y ? [axisTicks.y[0], axisTicks.y[axisTicks.y.length - 1]] : ['auto', 'auto']}
+                        ticks={logY ? undefined : axisTicks.y}
                         allowDataOverflow={logY}
-                        tickFormatter={logY ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : undefined}
+                        tickFormatter={logY ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : linearTickFmt}
                         label={{ value: data?.headers[1] || 'y', angle: -90, position: 'insideLeft', offset: -5, fill: '#9CA3AF', fontSize: 12 }} />
                       <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: 8, fontSize: 11 }} />
                       {showCI && chartDataMemo.fp.length > 0 && chartDataMemo.fp[0]?.bandUpper != null && (
@@ -1414,8 +1455,12 @@ export default function CurveFitter() {
                 <ResponsiveContainer width="100%" height={140}>
                   <ComposedChart data={residualData} margin={{ top: 5, right: 20, bottom: 20, left: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis dataKey="x" type="number" stroke="#9CA3AF" tick={{ fontSize: 10 }} />
-                    <YAxis stroke="#9CA3AF" tick={{ fontSize: 10 }} />
+                    <XAxis dataKey="x" type="number" stroke="#9CA3AF" tick={{ fontSize: 10 }}
+                      ticks={logX ? undefined : axisTicks.x}
+                      domain={logX ? ['auto', 'auto'] : axisTicks.x ? [axisTicks.x[0], axisTicks.x[axisTicks.x.length - 1]] : ['auto', 'auto']}
+                      tickFormatter={logX ? undefined : linearTickFmt} />
+                    <YAxis stroke="#9CA3AF" tick={{ fontSize: 10 }}
+                      tickFormatter={linearTickFmt} />
                     <Scatter dataKey="residual" fill="#EF4444" r={3} />
                     <Line dataKey="zero" stroke="#6B7280" strokeDasharray="5 5" dot={false} isAnimationActive={false} />
                   </ComposedChart>
