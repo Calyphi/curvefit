@@ -615,10 +615,32 @@ function buildModels(xData, yData) {
     (x, p) => p[0] * Math.sin(p[1] * x + p[2]) + p[3],
     seed, ["a", "ω", "φ", "d"], [0, 1]));
 
+  // Damped Oscillator: a·exp(-b·x)·cos(ω·x + φ) + d
+  const dampedSeeds = [
+    [yRange, 0.5, estOmega, 0, yMean],
+    [yRange * 1.5, 1.0, estOmega * 0.8, Math.PI / 4, yMin],
+    [yRange * 0.8, 0.2, estOmega * 1.2, 0, (yMin + yMean) / 2],
+  ];
+  dampedSeeds.forEach((seed, si) => add("DampedOsc", si === 0 ? "Damped Oscillator" : `Damped Osc (seed ${si + 1})`,
+    "y = a·exp(−b·x)·cos(ω·x + φ) + d", 5,
+    (x, p, E) => p[0] * (E || safeExp)(-p[1] * x) * Math.cos(p[2] * x + p[3]) + p[4],
+    seed, ["a", "b", "ω", "φ", "d"], [1]));
+
+  // Sine + linear trend: a·sin(ω·x + φ) + slope·x + intercept
+  const sineTrendSeeds = [
+    [yRange / 2, estOmega, 0, lr.a, yMean],
+    [yRange / 3, estOmega * 0.8, Math.PI / 2, 0, yMean],
+  ];
+  sineTrendSeeds.forEach((seed, si) => add("SineTrend", si === 0 ? "Sine + Trend" : `Sine + Trend (seed ${si + 1})`,
+    "y = a·sin(ω·x + φ) + b·x + c", 5,
+    (x, p) => p[0] * Math.sin(p[1] * x + p[2]) + p[3] * x + p[4],
+    seed, ["a", "ω", "φ", "slope", "intercept"], []));
+
   // Auto-generate "+d" offset variants for models that don't have one
   const familiesWithOffset = new Set([
     'Linear', 'Quadratic', 'Cubic', 'ExpDecay', 'Gaussian', '4PL', '5PL',
     'Reciprocal', 'BiExp', 'Lorentzian', 'Sine', 'Logarithmic', 'KWW', 'Custom',
+    'DampedOsc', 'SineTrend',
   ]);
   const seenFamilies = new Set();
   const offsetModels = [];
@@ -704,7 +726,7 @@ function parseData(text) {
 // CUSTOM MODEL PARSER — SECURE (no eval / no new Function)
 // Recursive-descent parser: tokenize → parse AST → compile to closure
 // Supports: +, -, *, /, ^, unary -, (), exp, log, ln, sqrt, abs, sin, cos, tan, pow, PI
-// Parameters: single letters (a-z except x,e) or subscripted (a1, k2)
+// Parameters: single letters (a-z except x) or subscripted (a1, k2)
 // Security: rejects ANY character outside strict whitelist (no [], {}, ;, =, etc.)
 // ============================================================
 function parseCustomModel(text) {
@@ -722,7 +744,7 @@ function parseCustomModel(text) {
 
   // ---- TOKENIZER (strict whitelist) ----
   const FUNCS = new Set(['exp', 'log', 'ln', 'sqrt', 'abs', 'sin', 'cos', 'tan', 'pow']);
-  const reserved = new Set(['x', 'e', 'exp', 'log', 'ln', 'sin', 'cos', 'tan', 'sqrt', 'abs', 'pow', 'min', 'max', 'pi']);
+  const reserved = new Set(['x', 'exp', 'log', 'ln', 'sin', 'cos', 'tan', 'sqrt', 'abs', 'pow', 'min', 'max', 'pi']);
   const tokens = [];
   const paramSet = new Set();
   let ti = 0;
@@ -1301,6 +1323,8 @@ export default function CurveFitter() {
     'BiExp': 'Two decay components (fast + slow). Parameters (a₁,k₁) and (a₂,k₂) are interchangeable — CIs may be inflated due to this symmetry.',
     'Gompertz': 'Asymmetric sigmoid — unlike Logistic, the inflection point is not at the midpoint.',
     'Lorentzian': 'Cauchy peak profile — heavier tails than Gaussian. Common in spectroscopy (NMR, XRD).',
+    'DampedOsc': 'Damped sinusoidal oscillation — exponential decay envelope × cosine. Common in mechanical vibrations, RLC circuits, and NMR.',
+    'SineTrend': 'Sinusoidal oscillation with linear trend — use for periodic data with drift.',
     'Custom': 'User-defined equation — fitted with multi-start (8 seeds). Rate params in exp(-k·x) auto-detected as positive.',
   };
 
