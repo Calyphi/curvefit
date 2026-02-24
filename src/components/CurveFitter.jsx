@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { Scatter, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ComposedChart } from "recharts";
 
 // ============================================================
@@ -1090,10 +1090,16 @@ export default function CurveFitter() {
   const [customExpr, setCustomExpr] = useState("");
   const [customError, setCustomError] = useState(null);
   const [copied, setCopied] = useState(null);
+  const [isDemo, setIsDemo] = useState(true);
   const chartRef = useRef(null);
+  const fitGenRef = useRef(0);
+  const demoInitRef = useRef(false);
+  const handleFitRef = useRef(null);
 
-  const handleParse = useCallback((text) => {
-    setRawText(text); setError(null); setResults(null); setSelectedModel(null);
+  const handleParse = useCallback((text, { demo = false } = {}) => {
+    fitGenRef.current++;
+    setRawText(text); setError(null); setResults(null); setSelectedModel(null); setFitting(false);
+    if (!demo) setIsDemo(false);
     const parsed = parseData(text);
     if (parsed) setData(parsed);
     else if (text.trim().length > 0) { setError("Need ≥3 rows with 2 numeric columns."); setData(null); }
@@ -1107,8 +1113,23 @@ export default function CurveFitter() {
     reader.readAsText(file);
   };
 
+  // Auto-load demo data on mount
+  useEffect(() => {
+    if (demoInitRef.current) return;
+    demoInitRef.current = true;
+    handleParse(SAMPLES["Enzyme Kinetics"], { demo: true });
+  }, [handleParse]);
+
+  // Auto-fit once demo data is parsed
+  useEffect(() => {
+    if (isDemo && data && !results && !fitting) {
+      handleFitRef.current?.();
+    }
+  }, [isDemo, data, results, fitting]);
+
   const handleFit = useCallback(() => {
     if (!data) return;
+    const gen = ++fitGenRef.current;
     setFitting(true); setFitProgress(0); setError(null); setCustomError(null);
     const models = buildModels(data.xData, data.yData);
 
@@ -1156,6 +1177,7 @@ export default function CurveFitter() {
     let idx = 0;
 
     const fitNext = () => {
+      if (gen !== fitGenRef.current) { setFitting(false); return; }
       const end = Math.min(idx + 3, total);
       for (let i = idx; i < end; i++) {
         const m = models[i];
@@ -1220,6 +1242,9 @@ export default function CurveFitter() {
     };
     setTimeout(fitNext, 10);
   }, [data, customExpr]);
+
+  // Keep ref in sync so useEffect can call without circular deps
+  handleFitRef.current = handleFit;
 
   const chartDataMemo = useMemo(() => {
     if (!data) return { dp: [], fp: [] };
@@ -1301,6 +1326,42 @@ export default function CurveFitter() {
 
   const fmt = (v) => { if (!isFinite(v)) return "—"; if (Math.abs(v) < 0.001 || Math.abs(v) > 99999) return v.toExponential(4); return v.toPrecision(6); };
 
+  // Nice tick computation for clean axis labels (linear mode only)
+  const niceTicks = (dMin, dMax, count = 5) => {
+    if (!isFinite(dMin) || !isFinite(dMax) || dMin === dMax) {
+      return dMin === dMax && isFinite(dMin) ? [dMin] : [];
+    }
+    const range = dMax - dMin;
+    const rawStep = range / count;
+    const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+    const residual = rawStep / mag;
+    let niceStep;
+    if (residual < 1.5) niceStep = 1 * mag;
+    else if (residual < 3) niceStep = 2 * mag;
+    else if (residual < 7) niceStep = 5 * mag;
+    else niceStep = 10 * mag;
+    const iLo = Math.floor(dMin / niceStep);
+    const iHi = Math.ceil(dMax / niceStep);
+    const ticks = [];
+    for (let i = iLo; i <= iHi; i++) {
+      ticks.push(parseFloat((i * niceStep).toPrecision(12)));
+    }
+    return ticks;
+  };
+
+  const linearTickFmt = (v) => parseFloat(v.toPrecision(6));
+
+  const axisTicks = useMemo(() => {
+    if (!data) return { x: undefined, y: undefined };
+    const xs = data.xData, ys = data.yData;
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    return {
+      x: logX ? undefined : niceTicks(xMin, xMax, 5),
+      y: logY ? undefined : niceTicks(yMin, yMax, 5),
+    };
+  }, [data, logX, logY]);
+
   const copyParams = (model) => {
     const lines = model.paramNames.map((n, i) => {
       const se = model.stdErrors && isFinite(model.stdErrors[i]) ? ` ± ${fmt(model.stdErrors[i])}` : '';
@@ -1324,7 +1385,9 @@ export default function CurveFitter() {
     'BiExp': 'Two decay components — useful for systems with fast and slow processes. Requires ≥8 points.',
     'Gompertz': 'Asymmetric sigmoid — unlike Logistic, the inflection point is not at the midpoint.',
     'Lorentzian': 'Cauchy peak profile — heavier tails than Gaussian. Common in spectroscopy (NMR, XRD).',
-    'Custom': 'User-defined model — initial guesses set automatically from data range.',
+    'DampedOsc': 'Damped sinusoidal oscillation — exponential decay envelope × cosine. Common in mechanical vibrations, RLC circuits, and NMR.',
+    'SineTrend': 'Sinusoidal oscillation with linear trend — use for periodic data with drift.',
+    'Custom': 'User-defined equation — fitted with multi-start (8 seeds). Rate params in exp(-k·x) auto-detected as positive.',
   };
 
   const handleExportSVG = () => {
@@ -1368,6 +1431,15 @@ export default function CurveFitter() {
             35+ scientific models · Auto-composition engine · Custom equations · AICc ranking · Akaike weights · CI bands · Client-side only
           </p>
         </header>
+
+        {isDemo && results && (
+          <div className="mb-3 flex items-center justify-between rounded-lg bg-blue-600/15 border border-blue-500/30 px-4 py-2.5">
+            <p className="text-sm text-blue-200">
+              Showing demo with enzyme kinetics data — paste your own data to get started.
+            </p>
+            <button onClick={() => setIsDemo(false)} className="text-blue-300 hover:text-white text-xs ml-4 shrink-0 focus:outline-none">✕ Dismiss</button>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
           {/* LEFT — Input & Ranking */}
@@ -1487,14 +1559,18 @@ export default function CurveFitter() {
                     <ComposedChart margin={{ top: 10, right: 20, bottom: 40, left: 20 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                       <XAxis dataKey="x" type="number" stroke="#9CA3AF" tick={{ fontSize: 11 }}
-                        scale={logX ? "log" : "auto"} domain={logX ? ['auto', 'auto'] : ['auto', 'auto']}
+                        scale={logX ? "log" : "auto"}
+                        domain={logX ? (chartDataMemo.xDomain || ['auto', 'auto']) : axisTicks.x ? [axisTicks.x[0], axisTicks.x[axisTicks.x.length - 1]] : ['auto', 'auto']}
+                        ticks={logX ? undefined : axisTicks.x}
                         allowDataOverflow={logX}
-                        tickFormatter={logX ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : undefined}
+                        tickFormatter={logX ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : linearTickFmt}
                         label={{ value: data?.headers[0] || 'x', position: 'bottom', offset: 20, fill: '#9CA3AF', fontSize: 12 }} />
                       <YAxis stroke="#9CA3AF" tick={{ fontSize: 11 }}
-                        scale={logY ? "log" : "auto"} domain={logY ? ['auto', 'auto'] : ['auto', 'auto']}
+                        scale={logY ? "log" : "auto"}
+                        domain={logY ? ['auto', 'auto'] : axisTicks.y ? [axisTicks.y[0], axisTicks.y[axisTicks.y.length - 1]] : ['auto', 'auto']}
+                        ticks={logY ? undefined : axisTicks.y}
                         allowDataOverflow={logY}
-                        tickFormatter={logY ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : undefined}
+                        tickFormatter={logY ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : linearTickFmt}
                         label={{ value: data?.headers[1] || 'y', angle: -90, position: 'insideLeft', offset: -5, fill: '#9CA3AF', fontSize: 12 }} />
                       <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: 8, fontSize: 11 }} />
                       {showCI && chartDataMemo.fp.length > 0 && chartDataMemo.fp[0]?.bandUpper != null && (
@@ -1538,8 +1614,11 @@ export default function CurveFitter() {
                 <ResponsiveContainer width="100%" height={140}>
                   <ComposedChart data={residualData} margin={{ top: 5, right: 20, bottom: 20, left: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis dataKey="x" type="number" stroke="#9CA3AF" tick={{ fontSize: 10 }} />
-                    <YAxis stroke="#9CA3AF" tick={{ fontSize: 10 }} />
+                    <XAxis dataKey="x" type="number" stroke="#9CA3AF" tick={{ fontSize: 10 }}
+                      ticks={logX ? undefined : axisTicks.x}
+                      domain={logX ? ['auto', 'auto'] : axisTicks.x ? [axisTicks.x[0], axisTicks.x[axisTicks.x.length - 1]] : ['auto', 'auto']}
+                      tickFormatter={logX ? undefined : linearTickFmt} />
+                    <YAxis stroke="#9CA3AF" tick={{ fontSize: 10 }} tickFormatter={linearTickFmt} />
                     <Scatter dataKey="residual" fill="#EF4444" r={3} />
                     <Line dataKey="zero" stroke="#6B7280" strokeDasharray="5 5" dot={false} isAnimationActive={false} />
                   </ComposedChart>
@@ -1580,11 +1659,17 @@ export default function CurveFitter() {
                 </div>
 
                 {/* Model note */}
-                {MODEL_NOTES[sel.family] && (
-                  <div className="text-xs text-blue-400/80 bg-blue-500/10 rounded px-2 py-1.5 mb-3">
-                    ℹ {MODEL_NOTES[sel.family]}
-                  </div>
-                )}
+                {(() => {
+                  const note = MODEL_NOTES[sel.family]
+                    || (sel.family.endsWith('_offset') && (MODEL_NOTES[sel.family.replace('_offset', '')]
+                      ? MODEL_NOTES[sel.family.replace('_offset', '')] + ' With vertical offset for non-zero baseline.'
+                      : 'Offset variant — adds vertical shift for data with non-zero baseline.'));
+                  return note ? (
+                    <div className="text-xs text-blue-400/80 bg-blue-500/10 rounded px-2 py-1.5 mb-3">
+                      ℹ {note}
+                    </div>
+                  ) : null;
+                })()}
 
                 {/* Parameters with CI */}
                 <div className="overflow-x-auto">
