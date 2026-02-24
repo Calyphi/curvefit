@@ -479,6 +479,17 @@ function buildModels(xData, yData) {
     (x, p, E) => p[0] / (1 + (E || safeExp)(-p[1] * (x - p[2]))),
     seed, ["L", "k", "x₀"], [0, 1]));
 
+  // 4-param Logistic with offset (most common real-world sigmoid)
+  const log4Seeds = [
+    [yRange, 4 / xRange, xMean, yMin],
+    [yRange * 0.8, 2 / xRange, xAtY((yMax + yMin) / 2), yMin],
+    [yMax, 8 / xRange, xMean + xRange * 0.1, yMin * 0.5],
+  ];
+  log4Seeds.forEach((seed, si) => add("Logistic4", si === 0 ? "Logistic + offset" : `Logistic + offset (seed ${si + 1})`,
+    "y = L / (1 + exp(−k·(x − x₀))) + d", 4,
+    (x, p, E) => p[0] / (1 + (E || safeExp)(-p[1] * (x - p[2]))) + p[3],
+    seed, ["L", "k", "x₀", "d"], [0, 1]));
+
   // Gaussian (multi-start)
   const gSeeds = [
     [yRange, xData[iMax] || xMean, xRange / 4, yMin],
@@ -947,6 +958,7 @@ export default function CurveFitter() {
 
   const handleFile = (e) => {
     const file = e.target.files[0]; if (!file) return;
+    setCustomExpr(""); setCustomError(null); // clear stale custom model
     const reader = new FileReader();
     reader.onload = (ev) => handleParse(ev.target.result);
     reader.readAsText(file);
@@ -1275,7 +1287,8 @@ export default function CurveFitter() {
     'BiExp': 'Two decay components (fast + slow). Parameters (a₁,k₁) and (a₂,k₂) are interchangeable — CIs may be inflated due to this symmetry.',
     'Gompertz': 'Asymmetric sigmoid — unlike Logistic, the inflection point is not at the midpoint.',
     'Lorentzian': 'Cauchy peak profile — heavier tails than Gaussian. Common in spectroscopy (NMR, XRD).',
-    'Custom': 'User-defined equation. Rate params in exp(-k·x) auto-detected as positive. Note: a^b^c = a^(b^c).',
+    'Logistic4': 'Logistic sigmoid with vertical offset — use when baseline is not zero.',
+    'Custom': 'User-defined equation — fitted with multi-start (8 seeds). Rate params in exp(-k·x) auto-detected as positive.',
   };
 
   const handleExportSVG = () => {
@@ -1310,9 +1323,11 @@ export default function CurveFitter() {
       <div className="max-w-6xl mx-auto">
         <header className="mb-5 flex items-start justify-between">
           <div>
-            <h1 className="text-3xl font-bold text-white tracking-tight">
-              <span className="text-blue-400">Curve</span>Fit
-            </h1>
+            <a href="https://calyphi.com" className="no-underline hover:opacity-80 transition-opacity">
+              <h1 className="text-3xl font-bold text-white tracking-tight">
+                <span className="text-blue-400">Curve</span>Fit
+              </h1>
+            </a>
             <p className="text-gray-400 mt-1 text-xs">
               25+ scientific models · Custom equations · AICc ranking · Akaike weights · Confidence intervals · Publication-ready · Client-side only
             </p>
@@ -1339,7 +1354,7 @@ export default function CurveFitter() {
               <h2 className="text-xs font-medium text-gray-400 uppercase tracking-wide">Sample data</h2>
               <div className="flex flex-wrap gap-1.5 mt-2" role="group" aria-label="Sample datasets">
                 {Object.keys(SAMPLES).map(name => (
-                  <button key={name} onClick={() => handleParse(SAMPLES[name])}
+                  <button key={name} onClick={() => { setCustomExpr(""); setCustomError(null); handleParse(SAMPLES[name]); }}
                     className="text-xs px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded text-gray-300 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500">{name}</button>
                 ))}
               </div>
