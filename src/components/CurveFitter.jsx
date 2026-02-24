@@ -1,21 +1,10 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { useState, useMemo, useCallback, useRef } from "react";
 import { Scatter, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ComposedChart } from "recharts";
-import ProModal from "./ProModal";
 
 // ============================================================
 // SAFE MATH
 // ============================================================
 const safeExp = (x) => Math.exp(Math.max(-700, Math.min(700, x)));
-
-// Safe power: prevents Infinity from x^n with large n
-const safePow = (base, exp) => {
-  if (base === 0) return exp > 0 ? 0 : NaN;
-  if (!isFinite(exp) || !isFinite(base)) return NaN;
-  const absBase = Math.abs(base);
-  // If |exp * log(|base|)| > 700, result would overflow/underflow
-  if (absBase > 0 && Math.abs(exp * Math.log(absBase)) > 700) return exp > 0 ? (absBase > 1 ? Infinity : 0) : (absBase > 1 ? 0 : Infinity);
-  return Math.pow(base, exp);
-};
 
 // Track clamp usage per fit
 function createSafeExpTracker() {
@@ -183,7 +172,6 @@ function levenbergMarquardt(func, xData, yData, initialParams, options = {}) {
   // AICc (falls back to AIC when n too small for correction)
   const aic = validCount > 0 ? validCount * Math.log(ssRes / validCount + 1e-30) + 2 * p : Infinity;
   const aicc = (validCount > p + 1) ? aic + (2 * p * (p + 1)) / (validCount - p - 1) : aic; // Fallback to AIC, not Infinity
-  const aiccFallback = !(validCount > p + 1); // true when n too small for AICc correction
 
   // ---- CONFIDENCE INTERVALS via covariance matrix ----
   // Cov ≈ s² * (JᵀJ)⁻¹ where s² = SSR / (n - p)
@@ -231,15 +219,10 @@ function levenbergMarquardt(func, xData, yData, initialParams, options = {}) {
     }
 
     // Tikhonov regularization: add ε·I to stabilize near-singular JᵀJ
-    // Use max(diag) for scale-invariance (more robust than trace/p)
-    let maxDiag = 0;
-    for (let j = 0; j < p; j++) maxDiag = Math.max(maxDiag, Math.abs(JtJfinal[j][j]));
-    const ridge = 1e-12 * (maxDiag || 1);
-    let ridgeApplied = false;
-    for (let j = 0; j < p; j++) {
-      if (JtJfinal[j][j] < ridge * 100) ridgeApplied = true;
-      JtJfinal[j][j] += ridge;
-    }
+    let traceJtJ = 0;
+    for (let j = 0; j < p; j++) traceJtJ += JtJfinal[j][j];
+    const ridge = 1e-12 * (traceJtJ / p || 1);
+    for (let j = 0; j < p; j++) JtJfinal[j][j] += ridge;
 
     covMatrix = invertMatrix(JtJfinal);
     if (covMatrix) {
@@ -258,7 +241,6 @@ function levenbergMarquardt(func, xData, yData, initialParams, options = {}) {
         }
       }
       if (!allValid) warnings.push("Some parameter uncertainties could not be estimated (singular covariance).");
-      if (ridgeApplied) warnings.push("Covariance regularized — uncertainties are approximate (near-singular JᵀJ).");
     } else {
       warnings.push("Covariance matrix is singular — parameter uncertainties unavailable.");
     }
@@ -295,9 +277,6 @@ function levenbergMarquardt(func, xData, yData, initialParams, options = {}) {
   if (rSquared < 0) {
     warnings.push("Negative R²: this model fits worse than a horizontal line at the mean.");
   }
-  if (aiccFallback) {
-    warnings.push("AICc correction unavailable (low data) — using AIC. Rankings less reliable.");
-  }
 
   // FIX: finalResiduals with NaN for invalid points, never 0
   // CRITICAL: Revalidate with FINAL params (may differ from mid-optimization validCount)
@@ -312,7 +291,7 @@ function levenbergMarquardt(func, xData, yData, initialParams, options = {}) {
   }
 
   return {
-    params: externalParams, rSquared, adjR2, aic, aicc, aiccFallback, cost,
+    params: externalParams, rSquared, adjR2, aic, aicc, cost,
     residuals: finalResiduals, stdErrors, ci95, warnings, dof,
     validCount, covMatrix, s2, tVal, nParams: p, finalInvalidCount
   };
@@ -372,6 +351,417 @@ function solveLinear(A, b) {
     x[i] /= M[i][i];
   }
   return x;
+}
+
+// ============================================================
+// ============================================================
+// CURVEFIT COMPOSER — Automatic Model Composition
+// Detects features in data → composes physics-informed candidates
+// ============================================================
+
+// --- Lomb-Scargle Periodogram ---
+function lombScargle(x, y, nFreq = 256) {
+  const n = x.length;
+  if (n < 4) return { frequencies: [], power: [], peakFreq: 0, peakPower: 0 };
+  const xSorted = [...x].sort((a, b) => a - b);
+  const xRange = xSorted[n - 1] - xSorted[0];
+  if (xRange <= 0) return { frequencies: [], power: [], peakFreq: 0, peakPower: 0 };
+  const diffs = [];
+  for (let i = 1; i < n; i++) diffs.push(xSorted[i] - xSorted[i - 1]);
+  diffs.sort((a, b) => a - b);
+  const medianDx = diffs[Math.floor(diffs.length / 2)] || xRange / n;
+  const fMin = 1 / (4 * xRange);
+  const fMax = 0.5 / medianDx;
+  const df = (fMax - fMin) / (nFreq - 1);
+  const yMean = y.reduce((s, v) => s + v, 0) / n;
+  const yc = y.map(v => v - yMean);
+  const yVar = yc.reduce((s, v) => s + v * v, 0) / n;
+  if (yVar < 1e-30) return { frequencies: [], power: [], peakFreq: 0, peakPower: 0 };
+  const frequencies = new Array(nFreq), power = new Array(nFreq);
+  let peakPower = 0, peakIdx = 0;
+  for (let k = 0; k < nFreq; k++) {
+    const f = fMin + k * df; const omega = 2 * Math.PI * f;
+    frequencies[k] = f;
+    let s2wt = 0, c2wt = 0;
+    for (let i = 0; i < n; i++) { const wt2 = 2 * omega * x[i]; s2wt += Math.sin(wt2); c2wt += Math.cos(wt2); }
+    const tau = Math.atan2(s2wt, c2wt) / (2 * omega);
+    let cc = 0, ss = 0, yc_cos = 0, yc_sin = 0;
+    for (let i = 0; i < n; i++) { const phase = omega * (x[i] - tau); const cosP = Math.cos(phase); const sinP = Math.sin(phase); cc += cosP * cosP; ss += sinP * sinP; yc_cos += yc[i] * cosP; yc_sin += yc[i] * sinP; }
+    power[k] = ((cc > 1e-30 ? (yc_cos * yc_cos) / cc : 0) + (ss > 1e-30 ? (yc_sin * yc_sin) / ss : 0)) / (2 * yVar);
+    if (power[k] > peakPower) { peakPower = power[k]; peakIdx = k; }
+  }
+  return { frequencies, power, peakFreq: frequencies[peakIdx], peakPower };
+}
+
+function lsSignificance(nData, nFreq, falseAlarmProb = 0.01) {
+  const M = nFreq;
+  const inner = Math.pow(1 - falseAlarmProb, 1 / M);
+  return -Math.log(1 - inner + 1e-30);
+}
+
+// --- Feature Detection ---
+function composerLinReg(x, y) {
+  const n = x.length;
+  if (n < 2) return { slope: 0, intercept: y[0] || 0, r2: 0 };
+  const mx = x.reduce((s, v) => s + v, 0) / n, my = y.reduce((s, v) => s + v, 0) / n;
+  let num = 0, den = 0, ssTot = 0;
+  for (let i = 0; i < n; i++) { num += (x[i] - mx) * (y[i] - my); den += (x[i] - mx) * (x[i] - mx); ssTot += (y[i] - my) * (y[i] - my); }
+  const slope = den > 1e-30 ? num / den : 0;
+  const intercept = my - slope * mx;
+  const ssRes = y.reduce((s, yi, i) => s + (yi - (slope * x[i] + intercept)) ** 2, 0);
+  return { slope, intercept, r2: ssTot > 1e-30 ? 1 - ssRes / ssTot : 0 };
+}
+
+function composerMovingAvg(y, window = 5) {
+  const n = y.length, half = Math.floor(window / 2), result = new Array(n);
+  for (let i = 0; i < n; i++) { const lo = Math.max(0, i - half), hi = Math.min(n - 1, i + half); let sum = 0; for (let j = lo; j <= hi; j++) sum += y[j]; result[i] = sum / (hi - lo + 1); }
+  return result;
+}
+
+function composerStd(arr) {
+  const n = arr.length; if (n < 2) return 0;
+  const mean = arr.reduce((s, v) => s + v, 0) / n;
+  return Math.sqrt(arr.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1));
+}
+
+function composerAutocorrelation(y, maxLag) {
+  const n = y.length, mean = y.reduce((s, v) => s + v, 0) / n;
+  const yc = y.map(v => v - mean);
+  const var0 = yc.reduce((s, v) => s + v * v, 0);
+  if (var0 < 1e-30) return new Array(maxLag).fill(0);
+  const acf = new Array(maxLag);
+  for (let lag = 0; lag < maxLag; lag++) { let sum = 0; for (let i = 0; i < n - lag; i++) sum += yc[i] * yc[i + lag]; acf[lag] = sum / var0; }
+  return acf;
+}
+
+function detectNoise(x, y) {
+  const n = y.length;
+  if (n < 5) return { noise_level: 0, snr_global: Infinity };
+  const smoothed = composerMovingAvg(y, Math.min(7, Math.max(3, Math.floor(n / 10))));
+  const residuals = y.map((v, i) => v - smoothed[i]);
+  const noise_level = composerStd(residuals);
+  const signal_std = composerStd(y);
+  return { noise_level, snr_global: noise_level > 1e-30 ? signal_std / noise_level : Infinity };
+}
+
+function detectTrend(x, y, noise_level) {
+  const n = x.length, xRange = x[n - 1] - x[0], yRange = Math.max(...y) - Math.min(...y);
+  const { slope, intercept, r2 } = composerLinReg(x, y);
+  const slopeSignificance = Math.abs(slope) * xRange / (noise_level || 1e-30);
+  const trendSignificant = (slopeSignificance > 2 && r2 > 0.15) || (slopeSignificance > 5 && r2 > 0.05);
+  let posCount = 0, negCount = 0;
+  for (let i = 1; i < n; i++) { if (y[i] > y[i - 1]) posCount++; else if (y[i] < y[i - 1]) negCount++; }
+  const is_monotonic = Math.max(posCount, negCount) / (n - 1) > 0.85;
+  const midIdx = Math.floor(n / 2);
+  const curvature = (y[midIdx] - (slope * x[midIdx] + intercept)) / (yRange || 1);
+  return { slope, intercept, r2_linear: r2, has_trend: trendSignificant, is_monotonic, curvature };
+}
+
+function detectPeriodicity(x, y, noise_level, trendFeatures) {
+  const n = x.length, xRange = x[n - 1] - x[0];
+  const NO = { has_periodicity: false, frequency: 0, period: 0, amplitude: 0, phase: 0, confidence: 0, period_consistent: false };
+  if (n < 12) return NO;
+  const detrended = y.map((v, i) => v - trendFeatures.slope * x[i] - trendFeatures.intercept);
+  let crossings = 0;
+  for (let i = 1; i < n; i++) if (detrended[i] * detrended[i - 1] < 0) crossings++;
+  const nFreq = Math.min(512, Math.max(128, n * 4));
+  const ls = lombScargle(x, detrended, nFreq);
+  if (ls.frequencies.length === 0) return NO;
+  const meanPower = ls.power.reduce((s, v) => s + v, 0) / ls.power.length;
+  const peakSNR = meanPower > 1e-30 ? ls.peakPower / meanPower : 0;
+  const sigThreshold = lsSignificance(n, nFreq, 0.01);
+  if (ls.peakPower < sigThreshold || peakSNR < 3) return NO;
+  const lsPeriod = 1 / ls.peakFreq, lsOmega = 2 * Math.PI * ls.peakFreq;
+  if (xRange / lsPeriod < 1.5) return NO;
+  const maxLagSamples = Math.min(n - 1, Math.floor(n * 0.7));
+  const acf = composerAutocorrelation(detrended, maxLagSamples);
+  let acfPeakLag = 0, acfPeakVal = 0, prevVal = acf[0] || 1, rising = false;
+  for (let lag = 1; lag < acf.length; lag++) {
+    if (acf[lag] > prevVal) rising = true;
+    if (rising && acf[lag] < prevVal && acfPeakVal < prevVal) { acfPeakLag = lag - 1; acfPeakVal = prevVal; break; }
+    prevVal = acf[lag];
+  }
+  const avgDx = xRange / (n - 1), acfPeriod = acfPeakLag * avgDx;
+  const period_consistent = acfPeriod > 0 && lsPeriod > 0 ? Math.abs(lsPeriod - acfPeriod) / lsPeriod < 0.3 : false;
+  if (peakSNR <= 10 && !period_consistent) return NO;
+  const amplitude = (Math.max(...detrended) - Math.min(...detrended)) / 2;
+  let firstPeakX = x[0], firstPeakY = -Infinity;
+  const searchRange = Math.min(n, Math.ceil(n / (xRange / lsPeriod) * 1.5));
+  for (let i = 0; i < searchRange; i++) if (detrended[i] > firstPeakY) { firstPeakY = detrended[i]; firstPeakX = x[i]; }
+  return { has_periodicity: true, frequency: lsOmega, period: lsPeriod, amplitude, phase: Math.PI / 2 - lsOmega * firstPeakX, confidence: peakSNR, period_consistent };
+}
+
+function detectSaturation(x, y, noise_level) {
+  const n = x.length;
+  if (n < 10) return { has_saturation: false, saturates_high: false, saturates_low: false, has_inflection: false, asymptote: 0, inflection_x: 0, growth_rate: 0 };
+  const split = Math.max(2, Math.floor(n * 0.2));
+  const xStart = x.slice(0, split), yStart = y.slice(0, split);
+  const xEnd = x.slice(n - split), yEnd = y.slice(n - split);
+  const lrEnd = composerLinReg(xEnd, yEnd);
+  const slopeEnd = Math.abs(lrEnd.slope);
+  const windowSize = Math.max(3, Math.floor(n * 0.15));
+  let maxSlope = 0, maxSlopeX = x[0];
+  for (let i = 0; i < n - windowSize; i++) {
+    const wlr = composerLinReg(x.slice(i, i + windowSize), y.slice(i, i + windowSize));
+    if (Math.abs(wlr.slope) > maxSlope) { maxSlope = Math.abs(wlr.slope); maxSlopeX = (x[i] + x[i + windowSize - 1]) / 2; }
+  }
+  const ratio = maxSlope > 1e-30 ? slopeEnd / maxSlope : 1;
+  const endVar = composerStd(yEnd);
+  const asymptote = yEnd.reduce((s, v) => s + v, 0) / yEnd.length;
+  const totalVar = composerStd(y);
+  const xRangeLocal = x[n - 1] - x[0] || 1;
+  const maxSlopeSignificant = maxSlope > 3 * noise_level / (xRangeLocal / 5);
+  const signalToNoise = totalVar > 0 ? totalVar / noise_level : 0;
+  const has_saturation = ratio < 0.25 && endVar < Math.max(2 * noise_level, 0.1 * totalVar) && maxSlopeSignificant && signalToNoise > 3;
+  const yMean = y.reduce((s, v) => s + v, 0) / n;
+  const saturates_high = has_saturation && asymptote > yMean;
+  const saturates_low = has_saturation && asymptote < yMean;
+  let has_inflection = false;
+  if (has_saturation && n >= 15) {
+    const windowD = Math.max(3, Math.floor(n * 0.08));
+    const d2vals = [];
+    for (let i = windowD; i < n - windowD; i++) {
+      const lrL = composerLinReg(x.slice(i - windowD, i), y.slice(i - windowD, i));
+      const lrR = composerLinReg(x.slice(i, i + windowD), y.slice(i, i + windowD));
+      d2vals.push(lrR.slope - lrL.slope);
+    }
+    if (d2vals.length >= 6) {
+      const mid = Math.floor(d2vals.length / 2);
+      const mF = d2vals.slice(0, mid).reduce((s, v) => s + v, 0) / mid;
+      const mS = d2vals.slice(mid).reduce((s, v) => s + v, 0) / (d2vals.length - mid);
+      const d2R = Math.max(...d2vals.map(Math.abs));
+      has_inflection = mF * mS < 0 && Math.abs(mF) > 0.1 * d2R && Math.abs(mS) > 0.1 * d2R;
+    }
+  }
+  const yRange = Math.max(...y) - Math.min(...y);
+  return { has_saturation, saturates_high, saturates_low, has_inflection, asymptote, inflection_x: maxSlopeX, growth_rate: yRange > 1e-30 ? 4 * maxSlope / yRange : 1 };
+}
+
+function detectDecay(x, y, noise_level, periodicFeatures) {
+  const n = x.length;
+  const NO = { has_decay: false, decay_rate: 0, decay_type: 'exp', baseline: 0 };
+  if (n < 8) return NO;
+  const tailN = Math.max(2, Math.floor(n * 0.2));
+  const baseline = y.slice(n - tailN).reduce((s, v) => s + v, 0) / tailN;
+  if (periodicFeatures && periodicFeatures.has_periodicity) {
+    const peaks = [];
+    for (let i = 1; i < n - 1; i++) if (y[i] > y[i - 1] && y[i] > y[i + 1] && y[i] - baseline > noise_level) peaks.push({ x: x[i], y: y[i] - baseline });
+    if (peaks.length >= 3) {
+      const logY = peaks.filter(p => p.y > 0).map(p => ({ x: p.x, ly: Math.log(p.y) }));
+      if (logY.length >= 3) { const lr = composerLinReg(logY.map(p => p.x), logY.map(p => p.ly)); if (lr.slope < -0.01 && lr.r2 > 0.5) return { has_decay: true, decay_rate: -lr.slope, decay_type: 'exp', baseline }; }
+    }
+    return NO;
+  }
+  const shifted = y.map(v => Math.abs(v - baseline));
+  const positives = [];
+  for (let i = 0; i < n; i++) if (shifted[i] > noise_level * 0.5) positives.push({ x: x[i], ly: Math.log(shifted[i]) });
+  if (positives.length < Math.floor(n * 0.5)) return NO;
+  const lr = composerLinReg(positives.map(p => p.x), positives.map(p => p.ly));
+  return (lr.slope < -0.01 && lr.r2 > 0.5) ? { has_decay: true, decay_rate: -lr.slope, decay_type: 'exp', baseline } : NO;
+}
+
+function detectBaseline(x, y, noise_level) {
+  const n = y.length, tailN = Math.max(2, Math.floor(n * 0.2));
+  const baseline = y.slice(n - tailN).reduce((s, v) => s + v, 0) / tailN;
+  const yRange = Math.max(...y) - Math.min(...y);
+  return { baseline, has_offset: Math.abs(baseline) > Math.max(0.05 * yRange, 2 * noise_level) };
+}
+
+function detectPeaks(x, y, noise_level, trendFeatures) {
+  const n = x.length;
+  const NO = { has_peak: false, peak_count: 0, peak_positions: [], peak_widths: [], peak_heights: [], is_symmetric: true };
+  if (n < 5) return NO;
+  const detrended = y.map((v, i) => v - trendFeatures.slope * x[i] - trendFeatures.intercept);
+  const peaks = [], threshold = 2 * noise_level;
+  for (let i = 1; i < n - 1; i++) {
+    if (detrended[i] > detrended[i - 1] && detrended[i] > detrended[i + 1]) {
+      let leftMin = detrended[i], rightMin = detrended[i];
+      for (let j = i - 1; j >= 0; j--) { leftMin = Math.min(leftMin, detrended[j]); if (detrended[j] > detrended[i]) break; }
+      for (let j = i + 1; j < n; j++) { rightMin = Math.min(rightMin, detrended[j]); if (detrended[j] > detrended[i]) break; }
+      const prominence = detrended[i] - Math.max(leftMin, rightMin);
+      if (prominence > threshold) {
+        const halfH = detrended[i] - prominence / 2;
+        let wL = x[i], wR = x[i];
+        for (let j = i - 1; j >= 0; j--) if (detrended[j] < halfH) { wL = x[j]; break; }
+        for (let j = i + 1; j < n; j++) if (detrended[j] < halfH) { wR = x[j]; break; }
+        peaks.push({ position: x[i], height: detrended[i], width: wR - wL, prominence });
+      }
+    }
+  }
+  if (peaks.length === 0) return NO;
+  let is_symmetric = true;
+  if (peaks.length === 1) {
+    const pi = x.findIndex(v => v === peaks[0].position);
+    if (pi > 2 && pi < n - 3) {
+      const cmp = Math.min(pi, n - 1 - pi, 5); let asym = 0;
+      for (let k = 1; k <= cmp; k++) asym += Math.abs(detrended[pi - k] - detrended[pi + k]);
+      is_symmetric = asym / (cmp * (peaks[0].prominence || 1)) < 0.3;
+    }
+  }
+  return { has_peak: true, peak_count: peaks.length, peak_positions: peaks.map(p => p.position), peak_widths: peaks.map(p => p.width), peak_heights: peaks.map(p => p.height), is_symmetric };
+}
+
+function detectAllFeatures(xData, yData) {
+  const noise = detectNoise(xData, yData);
+  const trend = detectTrend(xData, yData, noise.noise_level);
+  const periodic = detectPeriodicity(xData, yData, noise.noise_level, trend);
+  const saturation = detectSaturation(xData, yData, noise.noise_level);
+  const decay = detectDecay(xData, yData, noise.noise_level, periodic);
+  const offset = detectBaseline(xData, yData, noise.noise_level);
+  const peak = detectPeaks(xData, yData, noise.noise_level, trend);
+  return { noise, trend, periodic, saturation, decay, offset, peak };
+}
+
+// --- Model Composer ---
+const COMPOSER_PERTURB = {
+  amplitude: (v) => v * (0.5 + Math.random() * 1.5),
+  frequency: (v) => v * (0.7 + Math.random() * 0.6),
+  phase:     (v) => v + (Math.random() - 0.5) * 2 * Math.PI,
+  rate:      (v) => v * (0.5 + Math.random() * 1.5),
+  location:  (v) => v + (Math.random() - 0.5) * 0.4,
+  offset:    (v, f) => v + (Math.random() - 0.5) * (f._yRange || 1),
+  slope:     (v) => v * (0.5 + Math.random() * 1.5),
+  width:     (v) => v * (0.5 + Math.random() * 1.5),
+  curvature: (v) => v * (0.5 + Math.random() * 1.5),
+};
+
+const COMPOSER_CORES = {
+  sine: { key: 'sine', fn: (x, p) => p[0] * Math.sin(p[1] * x + p[2]), params: ['A', 'ω', 'φ'], roles: ['amplitude', 'frequency', 'phase'],
+    init: (f) => [f.periodic.amplitude || 1, f.periodic.frequency || 1, f.periodic.phase || 0], positiveIdx: [], eqStr: 'A·sin(ω·x + φ)' },
+  logistic: { key: 'logistic', fn: (x, p) => p[0] / (1 + safeExp(-p[1] * (x - p[2]))), params: ['L', 'k', 'x₀'], roles: ['amplitude', 'rate', 'location'],
+    init: (f) => [Math.max(0.1, (f.saturation.asymptote || 1) - (f._offsetEstimate || 0)), f.saturation.growth_rate || 1, f.saturation.inflection_x || 0], positiveIdx: [0, 1], eqStr: 'L/(1 + exp(−k·(x − x₀)))' },
+  gaussian: { key: 'gaussian', fn: (x, p) => p[0] * safeExp(-((x - p[1]) ** 2) / (2 * p[2] * p[2] + 1e-30)), params: ['a', 'μ', 'σ'], roles: ['amplitude', 'location', 'width'],
+    init: (f) => [f.peak.peak_heights?.[0] || 1, f.peak.peak_positions?.[0] || 0, f.peak.peak_widths?.[0] / 2.355 || 1], positiveIdx: [0, 2], eqStr: 'a·exp(−(x−μ)²/(2σ²))' },
+  lorentzian: { key: 'lorentzian', fn: (x, p) => p[0] / ((x - p[1]) ** 2 + p[2] * p[2]), params: ['a', 'x₀', 'γ'], roles: ['amplitude', 'location', 'width'],
+    init: (f) => [f.peak.peak_heights?.[0] * (f.peak.peak_widths?.[0] ** 2 || 1) || 1, f.peak.peak_positions?.[0] || 0, f.peak.peak_widths?.[0] / 2 || 1], positiveIdx: [0, 2], eqStr: 'a/((x−x₀)² + γ²)' },
+  exp_decay: { key: 'exp_decay', fn: (x, p) => p[0] * safeExp(-p[1] * x), params: ['a', 'b'], roles: ['amplitude', 'rate'],
+    init: (f) => [(Math.max(...(f._yData || [1])) - (f._offsetEstimate || 0)) || 1, f.decay.decay_rate || 0.5], positiveIdx: [1], eqStr: 'a·exp(−b·x)' },
+  quadratic: { key: 'quadratic', fn: (x, p) => p[0] * x * x + p[1] * x, params: ['a', 'b'], roles: ['curvature', 'slope'],
+    init: (f) => [f.trend.curvature * 0.1 || 0.01, f.trend.slope || 0], positiveIdx: [], eqStr: 'a·x² + b·x' },
+};
+
+const COMPOSER_MODS = {
+  exp_envelope: { key: 'exp_envelope', fn: (x, p) => safeExp(-p[0] * x), params: ['λ'], roles: ['rate'], init: (f) => [f.decay.decay_rate || 0.5], positiveIdx: [0], type: 'envelope', eqStr: 'exp(−λ·x)' },
+  linear_trend: { key: 'linear_trend', fn: (x, p) => p[0] * x, params: ['m'], roles: ['slope'], init: (f) => [f.trend.slope || 0], positiveIdx: [], type: 'trend', eqStr: 'm·x' },
+  offset: { key: 'offset', fn: (x, p) => p[0], params: ['d'], roles: ['offset'], init: (f) => [f._offsetEstimate || 0], positiveIdx: [], type: 'offset', eqStr: 'd' },
+};
+
+function composerEstimateOffset(features, xData, yData) {
+  const n = yData.length, yMean = yData.reduce((s, v) => s + v, 0) / n, yMin = Math.min(...yData), yMax = Math.max(...yData);
+  if (features.saturation.has_saturation) return features.saturation.saturates_high ? yMin + (yMax - yMin) * 0.02 : features.saturation.asymptote;
+  if (features.periodic.has_periodicity) return yMean;
+  if (features.decay.has_decay) { const tN = Math.max(2, Math.floor(n * 0.2)); const tail = yData.slice(n - tN).sort((a, b) => a - b); return tail[Math.floor(tail.length / 2)]; }
+  return yMean;
+}
+
+function composerNormalizeX(xData) {
+  const xMin = Math.min(...xData), xMax = Math.max(...xData), xRange = xMax - xMin || 1;
+  return { xNorm: xData.map(v => (v - xMin) / xRange), xMin, xMax, xRange };
+}
+
+function composerTransformToNorm(inits, roles, xMin, xRange) {
+  return inits.map((v, i) => {
+    switch (roles[i]) { case 'frequency': case 'rate': return v * xRange; case 'location': return (v - xMin) / xRange; case 'slope': return v * xRange; case 'curvature': return v * xRange * xRange; default: return v; }
+  });
+}
+
+function composerTransformFromNorm(params, roles, xMin, xRange) {
+  return params.map((v, i) => {
+    switch (roles[i]) { case 'frequency': case 'rate': return v / xRange; case 'location': return v * xRange + xMin; case 'slope': return v / xRange; case 'curvature': return v / (xRange * xRange); default: return v; }
+  });
+}
+
+function composerClampParams(params, roles, features, space = 'norm') {
+  const xRange = features._xRange || 1;
+  return params.map((v, i) => {
+    if (roles[i] === 'frequency') {
+      const ref = space === 'norm' ? (features.periodic.frequency || 1) * xRange : (features.periodic.frequency || 1);
+      return ref > 0 ? Math.max(0.3 * ref, Math.min(3 * ref, v)) : Math.max(0.01, v);
+    }
+    if (roles[i] === 'rate') return Math.max(0.001, Math.min(space === 'norm' ? 50 : 50 / xRange, v));
+    if (roles[i] === 'width') return Math.max(0.001, v);
+    return v;
+  });
+}
+
+function composerSelectCandidates(features) {
+  const c = [];
+  if (features.periodic.has_periodicity) {
+    if (features.decay.has_decay) { c.push({ name: 'Damped Oscillator', envelope: 'exp_envelope', core: 'sine', offset: 'offset' }); c.push({ name: 'Damped Osc + Trend', envelope: 'exp_envelope', core: 'sine', trend: 'linear_trend', offset: 'offset' }); c.push({ name: 'Sine + Offset', core: 'sine', offset: 'offset' }); }
+    else if (features.trend.has_trend) { c.push({ name: 'Sine + Trend', core: 'sine', trend: 'linear_trend', offset: 'offset' }); c.push({ name: 'Sine + Offset', core: 'sine', offset: 'offset' }); }
+    else c.push({ name: 'Sine + Offset', core: 'sine', offset: 'offset' });
+  }
+  if (features.saturation.has_saturation) {
+    if (features.saturation.has_inflection) { c.push({ name: 'Logistic + Offset', core: 'logistic', offset: 'offset' }); c.push({ name: 'Exp Approach', core: 'exp_decay', offset: 'offset' }); }
+    else { c.push({ name: 'Exp Approach', core: 'exp_decay', offset: 'offset' }); c.push({ name: 'Logistic + Offset', core: 'logistic', offset: 'offset' }); }
+    if (features.trend.has_trend) c.push({ name: 'Logistic + Trend', core: 'logistic', trend: 'linear_trend', offset: 'offset' });
+  }
+  if (features.peak.has_peak && features.peak.peak_count === 1) {
+    c.push({ name: 'Gaussian Peak', core: 'gaussian', offset: 'offset' }); c.push({ name: 'Lorentzian Peak', core: 'lorentzian', offset: 'offset' });
+    if (features.trend.has_trend) c.push({ name: 'Gaussian + Trend', core: 'gaussian', trend: 'linear_trend', offset: 'offset' });
+  }
+  if (features.decay.has_decay && !features.periodic.has_periodicity && !features.saturation.has_saturation) c.push({ name: 'Decay + Offset', core: 'exp_decay', offset: 'offset' });
+  if (features.trend.is_monotonic && !features.saturation.has_saturation && !features.periodic.has_periodicity && Math.abs(features.trend.curvature) > 0.05) c.push({ name: 'Quadratic', core: 'quadratic', offset: 'offset' });
+  return c;
+}
+
+function composerBuildModel(spec, features, xNormInfo) {
+  const parts = [];
+  if (spec.envelope) parts.push({ block: COMPOSER_MODS[spec.envelope], role: 'envelope' });
+  parts.push({ block: COMPOSER_CORES[spec.core], role: 'core' });
+  if (spec.trend) parts.push({ block: COMPOSER_MODS[spec.trend], role: 'trend' });
+  if (spec.offset) parts.push({ block: COMPOSER_MODS[spec.offset], role: 'offset' });
+  const allP = [], allR = [], allI = [], posIdx = [], slices = [];
+  let idx = 0;
+  for (const { block } of parts) {
+    slices.push({ start: idx, end: idx + block.params.length }); allP.push(...block.params); allR.push(...block.roles);
+    allI.push(...block.init(features)); for (const pi of block.positiveIdx) posIdx.push(idx + pi); idx += block.params.length;
+  }
+  if (allP.length > 7) return null;
+  const normI = composerTransformToNorm(allI, allR, xNormInfo.xMin, xNormInfo.xRange);
+  const eI = parts.findIndex(p => p.role === 'envelope'), cI = parts.findIndex(p => p.role === 'core'), tI = parts.findIndex(p => p.role === 'trend'), oI = parts.findIndex(p => p.role === 'offset');
+  const cS = slices[cI], eS = eI >= 0 ? slices[eI] : null, tS = tI >= 0 ? slices[tI] : null, oS = oI >= 0 ? slices[oI] : null;
+  const func = (x, p) => {
+    let v = parts[cI].block.fn(x, p.slice(cS.start, cS.end));
+    if (eS) v *= parts[eI].block.fn(x, p.slice(eS.start, eS.end));
+    if (tS) v += parts[tI].block.fn(x, p.slice(tS.start, tS.end));
+    if (oS) v += parts[oI].block.fn(x, p.slice(oS.start, oS.end));
+    return isFinite(v) ? v : NaN;
+  };
+  let eq = 'y = ';
+  const coreEq = COMPOSER_CORES[spec.core].eqStr;
+  if (spec.envelope) eq += COMPOSER_MODS[spec.envelope].eqStr + '·(' + coreEq + ')'; else eq += coreEq;
+  if (spec.trend) eq += ' + ' + COMPOSER_MODS[spec.trend].eqStr;
+  if (spec.offset) eq += ' + ' + COMPOSER_MODS[spec.offset].eqStr;
+  return { family: 'Composed_' + spec.name.replace(/\s+/g, '_'), name: '🧩 ' + spec.name, equation: eq, nParams: allP.length, func, init: normI, paramNames: allP, paramRoles: allR, positiveIdx: posIdx };
+}
+
+function composeModels(features, xData, yData) {
+  const n = xData.length;
+  if (n < 8) return [];
+  const xN = composerNormalizeX(xData);
+  const offEst = composerEstimateOffset(features, xData, yData);
+  features._yData = yData; features._yRange = Math.max(...yData) - Math.min(...yData);
+  features._xRange = xN.xRange; features._offsetEstimate = offEst;
+  const specs = composerSelectCandidates(features);
+  const seen = new Set(), models = [];
+  for (const spec of specs) {
+    if (seen.has(spec.name)) continue; seen.add(spec.name);
+    const model = composerBuildModel(spec, features, xN);
+    if (!model) continue;
+    // Generate 8 init candidates in normalized space
+    const normCands = [model.init];
+    for (let i = 1; i < 8; i++) {
+      let init = model.init.map((v, j) => { const fn = COMPOSER_PERTURB[model.paramRoles[j]]; return fn ? fn(v, features) : v * (0.5 + Math.random()); });
+      init = composerClampParams(init, model.paramRoles, features, 'norm');
+      for (const pi of model.positiveIdx) init[pi] = Math.abs(init[pi]) || 0.01;
+      normCands.push(init);
+    }
+    const origCands = normCands.map(init => composerTransformFromNorm(init, model.paramRoles, xN.xMin, xN.xRange));
+    const roles = model.paramRoles, feat = { ...features };
+    models.push({ ...model, init: origCands[0], initCandidates: origCands, clampFn: (p) => composerClampParams(p, roles, feat, 'orig') });
+  }
+  return models;
 }
 
 // ============================================================
@@ -454,7 +844,7 @@ function buildModels(xData, yData) {
   if (posPairs.length > n * 0.7) {
     const plr = linReg(posPairs.map(q => q.lx), posPairs.map(q => q.ly));
     add("PowerLaw", "Power Law", "y = a·x^b", 2,
-      (x, p) => { const v = safePow(Math.abs(x) + 1e-30, p[1]); return isFinite(v) ? p[0] * v : NaN; },
+      (x, p) => p[0] * Math.pow(Math.abs(x) + 1e-30, p[1]),
       [Math.exp(plr.b), plr.a], ["a", "b"], [0]);
   }
   if (posXCount > n * 0.8) {
@@ -496,14 +886,14 @@ function buildModels(xData, yData) {
       (x, p) => p[0] * x / (p[1] + x + 1e-30),
       [yMax * 1.2, xAtY(yMax / 2)], ["Vmax", "Km"], [0, 1]);
     add("Hill", "Hill Equation", "y = Vmax·xⁿ / (Kⁿ + xⁿ)", 3,
-      (x, p) => { const xn = safePow(Math.abs(x) + 1e-30, p[2]); const kn = safePow(p[1] + 1e-30, p[2]); return isFinite(xn) && isFinite(kn) ? p[0] * xn / (kn + xn + 1e-30) : NaN; },
+      (x, p) => { const xn = Math.pow(Math.abs(x) + 1e-30, p[2]); const kn = Math.pow(p[1] + 1e-30, p[2]); return p[0] * xn / (kn + xn + 1e-30); },
       [yMax * 1.2, xAtY(yMax / 2), 1.5], ["Vmax", "K", "n"], [0, 1, 2]);
   }
 
   // 4PL Dose-Response
   if (posXCount > n * 0.5) {
     add("4PL", "4PL Dose-Response", "y = d + (a−d)/(1+(x/c)ᵇ)", 4,
-      (x, p) => { const pw = safePow(Math.abs(x) / (p[2] + 1e-30), p[1]); return isFinite(pw) ? p[3] + (p[0] - p[3]) / (1 + pw) : NaN; },
+      (x, p) => p[3] + (p[0] - p[3]) / (1 + Math.pow(Math.abs(x) / (p[2] + 1e-30), p[1])),
       [yMax, 1, xAtY((yMax + yMin) / 2), yMin], ["a", "b", "c", "d"], [1, 2]);
   }
 
@@ -515,7 +905,7 @@ function buildModels(xData, yData) {
   }
   if (posPairs.length > n * 0.7) {
     add("Freundlich", "Freundlich Isotherm", "y = Kf·x^(1/n)", 2,
-      (x, p) => { const v = safePow(Math.abs(x) + 1e-30, 1 / (p[1] + 1e-30)); return isFinite(v) ? p[0] * v : NaN; },
+      (x, p) => p[0] * Math.pow(Math.abs(x) + 1e-30, 1 / (p[1] + 1e-30)),
       [yMean, 2], ["Kf", "n"], [0, 1]);
   }
 
@@ -542,7 +932,7 @@ function buildModels(xData, yData) {
   const kwwSeeds = [[yRange, xRange / 2, 0.7, yMin], [yRange, xRange / 5, 0.5, yMin], [yRange * 0.8, xRange, 1.0, (yMin + yMean) / 2]];
   kwwSeeds.forEach((seed, si) => add("KWW", si === 0 ? "Stretched Exponential" : `Stretched Exp (seed ${si + 1})`,
     "y = a·exp(−(x/τ)^β) + c", 4,
-    (x, p, E) => { const pw = safePow(Math.abs(x) / (p[1] + 1e-30), p[2]); return isFinite(pw) ? p[0] * (E || safeExp)(-pw) + p[3] : NaN; },
+    (x, p, E) => p[0] * (E || safeExp)(-Math.pow(Math.abs(x) / (p[1] + 1e-30), p[2])) + p[3],
     seed, ["a", "τ", "β", "c"], [0, 1, 2]));
 
   // Growth
@@ -552,7 +942,7 @@ function buildModels(xData, yData) {
 
   if (posXCount > n * 0.7) {
     add("Weibull", "Weibull CDF", "y = a·(1 − exp(−(x/λ)^k))", 3,
-      (x, p, E) => { const pw = safePow(Math.abs(x) / (p[1] + 1e-30), p[2]); return isFinite(pw) ? p[0] * (1 - (E || safeExp)(-pw)) : NaN; },
+      (x, p, E) => p[0] * (1 - (E || safeExp)(-Math.pow(Math.abs(x) / (p[1] + 1e-30), p[2]))),
       [yMax, xMean, 1.5], ["a", "λ", "k"], [0, 1, 2]);
   }
 
@@ -564,42 +954,20 @@ function buildModels(xData, yData) {
   // 5PL Dose-Response (asymmetric sigmoid)
   if (posXCount > n * 0.5) {
     add("5PL", "5PL Dose-Response", "y = d + (a−d)/((1+(x/c)ᵇ)ᵍ)", 5,
-      (x, p) => { const pw = safePow(Math.abs(x) / (p[2] + 1e-30), p[1]); if (!isFinite(pw)) return NaN; const denom = safePow(1 + pw, p[4]); return isFinite(denom) && denom !== 0 ? p[3] + (p[0] - p[3]) / denom : NaN; },
+      (x, p) => p[3] + (p[0] - p[3]) / Math.pow(1 + Math.pow(Math.abs(x) / (p[2] + 1e-30), p[1]), p[4]),
       [yMax, 1, xAtY((yMax + yMin) / 2), yMin, 1], ["a", "b", "c", "d", "g"], [1, 2, 4]);
   }
 
-  // Bi-Exponential Decay (5 params — needs sufficient data)
-  if (n >= 8) {
-    add("BiExp", "Bi-Exponential Decay", "y = a₁·exp(−k₁·x) + a₂·exp(−k₂·x) + c", 5,
-      (x, p, E) => p[0] * (E || safeExp)(-p[1] * x) + p[2] * (E || safeExp)(-p[3] * x) + p[4],
-      [yRange * 0.6, 2 / xRange, yRange * 0.3, 0.5 / xRange, yMin],
-      ["a₁", "k₁", "a₂", "k₂", "c"], [0, 1, 2, 3]);
-  }
+  // Bi-Exponential Decay
+  add("BiExp", "Bi-Exponential Decay", "y = a₁·exp(−k₁·x) + a₂·exp(−k₂·x) + c", 5,
+    (x, p, E) => p[0] * (E || safeExp)(-p[1] * x) + p[2] * (E || safeExp)(-p[3] * x) + p[4],
+    [yRange * 0.6, 2 / xRange, yRange * 0.3, 0.5 / xRange, yMin],
+    ["a₁", "k₁", "a₂", "k₂", "c"], [0, 1, 2, 3]);
 
-  // Gompertz Growth: y = a*exp(-b*exp(-c*x))
-  // Linearization: if y>0 and y<a, then ln(-ln(y/a)) = ln(b) - c*x
-  {
-    const aGuess = yMax * 1.1;
-    let bGuess = 5, cGuess = 0.5 / (xRange + 1e-30);
-    // Try linearization for better seeds
-    const gomPairs = [];
-    for (let gi = 0; gi < n; gi++) {
-      if (yData[gi] > 0 && yData[gi] < aGuess) {
-        const lnlnRatio = Math.log(-Math.log(yData[gi] / aGuess));
-        if (isFinite(lnlnRatio)) gomPairs.push({ x: xData[gi], y: lnlnRatio });
-      }
-    }
-    if (gomPairs.length > 2) {
-      const glr = linReg(gomPairs.map(q => q.x), gomPairs.map(q => q.y));
-      if (isFinite(glr.a) && isFinite(glr.b)) {
-        cGuess = Math.abs(glr.a) || cGuess;
-        bGuess = Math.exp(Math.max(-10, Math.min(10, glr.b)));
-      }
-    }
-    add("Gompertz", "Gompertz", "y = a·exp(−b·exp(−c·x))", 3,
-      (x, p, E) => p[0] * (E || safeExp)(-p[1] * (E || safeExp)(-p[2] * x)),
-      [aGuess, bGuess, cGuess], ["a", "b", "c"], [0, 1, 2]);
-  }
+  // Gompertz Growth
+  add("Gompertz", "Gompertz", "y = a·exp(−b·exp(−c·x))", 3,
+    (x, p, E) => p[0] * (E || safeExp)(-p[1] * (E || safeExp)(-p[2] * x)),
+    [yMax * 1.1, 5, 0.5 / (xRange + 1e-30)], ["a", "b", "c"], [0, 1, 2]);
 
   // Lorentzian (Cauchy peak)
   add("Lorentzian", "Lorentzian", "y = a/((x−x₀)² + γ²) + c", 4,
@@ -615,53 +983,6 @@ function buildModels(xData, yData) {
     (x, p) => p[0] * Math.sin(p[1] * x + p[2]) + p[3],
     seed, ["a", "ω", "φ", "d"], [0, 1]));
 
-  // Damped Oscillator: a·exp(-b·x)·cos(ω·x + φ) + d
-  const dampedSeeds = [
-    [yRange, 0.5, estOmega, 0, yMean],
-    [yRange * 1.5, 1.0, estOmega * 0.8, Math.PI / 4, yMin],
-    [yRange * 0.8, 0.2, estOmega * 1.2, 0, (yMin + yMean) / 2],
-  ];
-  dampedSeeds.forEach((seed, si) => add("DampedOsc", si === 0 ? "Damped Oscillator" : `Damped Osc (seed ${si + 1})`,
-    "y = a·exp(−b·x)·cos(ω·x + φ) + d", 5,
-    (x, p, E) => p[0] * (E || safeExp)(-p[1] * x) * Math.cos(p[2] * x + p[3]) + p[4],
-    seed, ["a", "b", "ω", "φ", "d"], [1]));
-
-  // Sine + linear trend: a·sin(ω·x + φ) + slope·x + intercept
-  const sineTrendSeeds = [
-    [yRange / 2, estOmega, 0, lr.a, yMean],
-    [yRange / 3, estOmega * 0.8, Math.PI / 2, 0, yMean],
-  ];
-  sineTrendSeeds.forEach((seed, si) => add("SineTrend", si === 0 ? "Sine + Trend" : `Sine + Trend (seed ${si + 1})`,
-    "y = a·sin(ω·x + φ) + b·x + c", 5,
-    (x, p) => p[0] * Math.sin(p[1] * x + p[2]) + p[3] * x + p[4],
-    seed, ["a", "ω", "φ", "slope", "intercept"], []));
-
-  // Auto-generate "+d" offset variants for models that don't have one
-  const familiesWithOffset = new Set([
-    'Linear', 'Quadratic', 'Cubic', 'ExpDecay', 'Gaussian', '4PL', '5PL',
-    'Reciprocal', 'BiExp', 'Lorentzian', 'Sine', 'Logarithmic', 'KWW', 'Custom',
-    'DampedOsc', 'SineTrend',
-  ]);
-  const seenFamilies = new Set();
-  const offsetModels = [];
-  for (const m of models) {
-    if (familiesWithOffset.has(m.family)) continue;
-    if (seenFamilies.has(m.family)) continue;
-    seenFamilies.add(m.family);
-    const origFunc = m.func;
-    offsetModels.push({
-      family: m.family + '_offset',
-      name: m.name + ' + offset',
-      equation: m.equation + ' + d',
-      nParams: m.nParams + 1,
-      func: (x, p, E) => origFunc(x, p.slice(0, -1), E) + p[p.length - 1],
-      init: [...m.init, yMin],
-      paramNames: [...m.paramNames, 'd'],
-      positiveIdx: m.positiveIdx || [],
-    });
-  }
-  models.push(...offsetModels);
-
   return models;
 }
 
@@ -672,62 +993,24 @@ function parseData(text) {
   const lines = text.trim().split(/\r?\n/).filter(l => l.trim());
   if (lines.length < 2) return null;
   const dataLine = lines[Math.min(1, lines.length - 1)];
-
-  // Detect separator: tab > semicolon > comma > whitespace
-  let sep;
-  if (dataLine.includes('\t')) {
-    sep = '\t';
-  } else if ((dataLine.split(';').length - 1) > (dataLine.split(',').length - 1)) {
-    sep = ';';
-  } else if (dataLine.includes(',')) {
-    sep = ',';
-  } else if (/\s{2,}/.test(dataLine) || /^\s*\S+\s+\S+/.test(dataLine)) {
-    sep = 'SPACE';
-  } else {
-    sep = ',';
-  }
-
-  // European decimal comma detection: semicolon separator + commas inside numbers
-  // e.g. "1,5;10,3" → sep=';', values contain commas as decimal separators
-  let euDecimal = false;
-  if (sep === ';') {
-    const testParts = dataLine.split(';').map(s => s.trim());
-    const hasCommaNumbers = testParts.some(p => /^\d+,\d+$/.test(p));
-    const allParseOk = testParts.every(p => isFinite(parseFloat(p)));
-    if (hasCommaNumbers && !allParseOk) {
-      euDecimal = true;
-    }
-  }
-
-  const splitLine = (line) => {
-    if (sep === 'SPACE') return line.trim().split(/\s+/);
-    return line.split(sep);
-  };
-
-  const parseNum = (s) => {
-    let v = s.trim();
-    if (euDecimal) v = v.replace(',', '.');
-    return parseFloat(v);
-  };
-
-  const firstParts = splitLine(lines[0]).map(s => s.trim());
-  const hasHeader = firstParts.some(p => isNaN(parseNum(p)) && p.length > 0);
+  const sep = dataLine.includes('\t') ? '\t' : (dataLine.split(';').length - 1) > (dataLine.split(',').length - 1) ? ';' : ',';
+  const firstParts = lines[0].split(sep).map(s => s.trim());
+  const hasHeader = firstParts.some(p => isNaN(parseFloat(p)) && p.length > 0);
   const startIdx = hasHeader ? 1 : 0;
   const headers = hasHeader ? firstParts : ['x', 'y'];
   const xData = [], yData = [];
   for (let i = startIdx; i < lines.length; i++) {
-    const parts = splitLine(lines[i]).map(s => parseNum(s));
+    const parts = lines[i].split(sep).map(s => parseFloat(s.trim()));
     if (parts.length >= 2 && isFinite(parts[0]) && isFinite(parts[1])) { xData.push(parts[0]); yData.push(parts[1]); }
   }
   return xData.length >= 3 ? { xData, yData, headers: [headers[0] || 'x', headers[1] || 'y'], n: xData.length } : null;
 }
 
 // ============================================================
-// CUSTOM MODEL PARSER — SECURE (no eval / no new Function)
-// Recursive-descent parser: tokenize → parse AST → compile to closure
-// Supports: +, -, *, /, ^, unary -, (), exp, log, ln, sqrt, abs, sin, cos, tan, pow, PI
-// Parameters: single letters (a-z except x) or subscripted (a1, k2)
-// Security: rejects ANY character outside strict whitelist (no [], {}, ;, =, etc.)
+// CUSTOM MODEL PARSER
+// Accepts: "y = a * exp(-b * x) + c" or "Name: a * x^b"
+// Parameters: single letters (a-z except x,e) or subscripted (a1, k2)
+// Math: exp, log, ln, sqrt, abs, sin, cos, tan, pow, PI, ^
 // ============================================================
 function parseCustomModel(text) {
   const trimmed = text.trim();
@@ -742,208 +1025,39 @@ function parseCustomModel(text) {
   expr = expr.replace(/^y\s*=\s*/i, '');
   if (!expr) return null;
 
-  // ---- TOKENIZER (strict whitelist) ----
-  const FUNCS = new Set(['exp', 'log', 'ln', 'sqrt', 'abs', 'sin', 'cos', 'tan', 'pow']);
-  const reserved = new Set(['x', 'exp', 'log', 'ln', 'sin', 'cos', 'tan', 'sqrt', 'abs', 'pow', 'min', 'max', 'pi']);
-  const tokens = [];
+  // Detect parameters: lowercase letters or letter+digit combos, excluding math keywords and 'x'
+  const reserved = new Set(['x', 'e', 'exp', 'log', 'ln', 'sin', 'cos', 'tan', 'sqrt', 'abs', 'pow', 'min', 'max', 'pi']);
   const paramSet = new Set();
-  let ti = 0;
-
-  while (ti < expr.length) {
-    const ch = expr[ti];
-    if (/\s/.test(ch)) { ti++; continue; }
-
-    // Number (including decimals and scientific notation like 1.5e-3)
-    if (/[0-9.]/.test(ch)) {
-      let num = '';
-      while (ti < expr.length && /[0-9.]/.test(expr[ti])) num += expr[ti++];
-      if (ti < expr.length && /[eE]/.test(expr[ti])) {
-        num += expr[ti++];
-        if (ti < expr.length && /[+\-]/.test(expr[ti])) num += expr[ti++];
-        while (ti < expr.length && /[0-9]/.test(expr[ti])) num += expr[ti++];
-      }
-      const val = parseFloat(num);
-      if (!isFinite(val)) return null;
-      tokens.push({ type: 'NUM', value: val });
-      continue;
-    }
-
-    // Word (function, variable, parameter, constant)
-    if (/[a-zA-Z]/.test(ch)) {
-      let word = '';
-      while (ti < expr.length && /[a-zA-Z0-9]/.test(expr[ti])) word += expr[ti++];
-      const lw = word.toLowerCase();
-      if (lw === 'pi') { tokens.push({ type: 'NUM', value: Math.PI }); }
-      else if (lw === 'x') { tokens.push({ type: 'VAR' }); }
-      else if (FUNCS.has(lw)) { tokens.push({ type: 'FUNC', value: lw }); }
-      else if (/^[a-z]\d*$/.test(lw) && lw.length <= 3 && !reserved.has(lw)) {
-        paramSet.add(lw); tokens.push({ type: 'PARAM', value: lw });
-      }
-      else return null; // Unknown identifier — reject
-      continue;
-    }
-
-    // Operators and parens (strict whitelist)
-    if ('+-*/^(),'.includes(ch)) { tokens.push({ type: ch }); ti++; continue; }
-    // Unicode minus (−) and multiplication (·, ×)
-    if (ch === '\u2212' || ch === '\u2013') { tokens.push({ type: '-' }); ti++; continue; }
-    if (ch === '\u00B7' || ch === '\u00D7') { tokens.push({ type: '*' }); ti++; continue; }
-
-    return null; // REJECT any unexpected character (security: no [], {}, ;, =, ?, :, ', ", `, \, <, > etc.)
-  }
+  // Match subscripted first (a1, k2), then single letters
+  for (const m of expr.matchAll(/\b([a-z]\d+)\b/g)) { if (!reserved.has(m[1])) paramSet.add(m[1]); }
+  for (const m of expr.matchAll(/\b([a-z])\b/g)) { if (!reserved.has(m[1])) paramSet.add(m[1]); }
 
   const paramNames = Array.from(paramSet).sort();
   if (paramNames.length === 0 || paramNames.length > 8) return null;
-  const paramIdx = Object.fromEntries(paramNames.map((n, i) => [n, i]));
 
-  // ---- RECURSIVE DESCENT PARSER → AST ----
-  let pos = 0;
-  const peek = () => pos < tokens.length ? tokens[pos] : null;
-  const consume = (type) => { const t = peek(); if (t && t.type === type) { pos++; return t; } return null; };
-  const expect = (type) => { const t = consume(type); if (!t) throw new Error('parse'); return t; };
+  // Build function body
+  let body = expr;
+  const sorted = [...paramNames].sort((a, b) => b.length - a.length);
+  sorted.forEach(pn => {
+    const idx = paramNames.indexOf(pn);
+    body = body.replace(new RegExp(`\\b${pn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'), `p[${idx}]`);
+  });
+  body = body.replace(/\bexp\b/g, 'Math.exp').replace(/\b(log|ln)\b/g, 'Math.log')
+    .replace(/\bsqrt\b/g, 'Math.sqrt').replace(/\babs\b/g, 'Math.abs')
+    .replace(/\bsin\b/g, 'Math.sin').replace(/\bcos\b/g, 'Math.cos')
+    .replace(/\btan\b/g, 'Math.tan').replace(/\bpow\b/g, 'Math.pow')
+    .replace(/\bPI\b/gi, 'Math.PI').replace(/\^/g, '**');
 
-  // Grammar:
-  //   expr  → term (('+' | '-') term)*
-  //   term  → unary (('*' | '/') unary)*   [with implicit multiply detection]
-  //   unary → '-' unary | '+' unary | power
-  //   power → atom ('^' unary)?
-  //   atom  → NUM | VAR | PARAM | FUNC '(' expr (',' expr)? ')' | '(' expr ')'
-
-  function parseExpr() {
-    let node = parseTerm();
-    while (peek() && (peek().type === '+' || peek().type === '-')) {
-      const op = tokens[pos++].type;
-      node = { op, left: node, right: parseTerm() };
-    }
-    return node;
-  }
-
-  function parseTerm() {
-    let node = parseUnary();
-    while (true) {
-      const next = peek();
-      if (!next) break;
-      // Explicit multiply/divide
-      if (next.type === '*' || next.type === '/') {
-        const op = tokens[pos++].type;
-        node = { op, left: node, right: parseUnary() };
-      }
-      // Implicit multiplication: 2x, 2a, a(x+1), 2(3+x), etc.
-      else if (next.type === 'NUM' || next.type === 'VAR' || next.type === 'PARAM' || next.type === 'FUNC' || next.type === '(') {
-        node = { op: '*', left: node, right: parseUnary() };
-      }
-      else break;
-    }
-    return node;
-  }
-
-  function parseUnary() {
-    if (peek() && peek().type === '-') { pos++; return { op: 'neg', child: parseUnary() }; }
-    if (peek() && peek().type === '+') { pos++; return parseUnary(); }
-    return parsePower();
-  }
-
-  function parsePower() {
-    let node = parseAtom();
-    if (peek() && peek().type === '^') { pos++; node = { op: '^', left: node, right: parseUnary() }; }
-    return node;
-  }
-
-  function parseAtom() {
-    const t = peek();
-    if (!t) throw new Error('parse');
-    if (t.type === 'NUM') { pos++; return { op: 'num', value: t.value }; }
-    if (t.type === 'VAR') { pos++; return { op: 'var' }; }
-    if (t.type === 'PARAM') { pos++; return { op: 'param', index: paramIdx[t.value] }; }
-    if (t.type === 'FUNC') {
-      pos++;
-      expect('(');
-      const arg1 = parseExpr();
-      let arg2 = null;
-      if (peek() && peek().type === ',') { pos++; arg2 = parseExpr(); }
-      expect(')');
-      return { op: 'func', name: t.value, arg1, arg2 };
-    }
-    if (t.type === '(') { pos++; const node = parseExpr(); expect(')'); return node; }
-    throw new Error('parse');
-  }
-
-  let ast;
   try {
-    ast = parseExpr();
-    if (pos !== tokens.length) return null; // Trailing tokens — reject
+    const fn = new Function('x', 'p', 'E', `"use strict"; return (${body});`);
+    const test = fn(1, new Array(paramNames.length).fill(1), safeExp);
+    if (typeof test !== 'number') return null;
+    return {
+      family: 'Custom', name, equation: `y = ${expr}`, nParams: paramNames.length,
+      func: (x, p, E) => { try { return fn(x, p, E); } catch { return NaN; } },
+      init: new Array(paramNames.length).fill(1), paramNames, positiveIdx: []
+    };
   } catch { return null; }
-
-  // ---- COMPILE AST → CLOSURE (no eval, no Function constructor) ----
-  function compile(node) {
-    switch (node.op) {
-      case 'num': { const v = node.value; return () => v; }
-      case 'var': return (x) => x;
-      case 'param': { const idx = node.index; return (x, p) => p[idx]; }
-      case 'neg': { const c = compile(node.child); return (x, p, E) => -c(x, p, E); }
-      case '+': { const l = compile(node.left), r = compile(node.right); return (x, p, E) => l(x, p, E) + r(x, p, E); }
-      case '-': { const l = compile(node.left), r = compile(node.right); return (x, p, E) => l(x, p, E) - r(x, p, E); }
-      case '*': { const l = compile(node.left), r = compile(node.right); return (x, p, E) => l(x, p, E) * r(x, p, E); }
-      case '/': { const l = compile(node.left), r = compile(node.right); return (x, p, E) => { const d = r(x, p, E); return d === 0 ? NaN : l(x, p, E) / d; }; }
-      case '^': { const l = compile(node.left), r = compile(node.right); return (x, p, E) => safePow(l(x, p, E), r(x, p, E)); }
-      case 'func': {
-        const a1 = compile(node.arg1);
-        const a2 = node.arg2 ? compile(node.arg2) : null;
-        switch (node.name) {
-          case 'exp': return (x, p, E) => (E || safeExp)(a1(x, p, E));
-          case 'log': case 'ln': return (x, p, E) => Math.log(a1(x, p, E));
-          case 'sqrt': return (x, p, E) => Math.sqrt(a1(x, p, E));
-          case 'abs': return (x, p, E) => Math.abs(a1(x, p, E));
-          case 'sin': return (x, p, E) => Math.sin(a1(x, p, E));
-          case 'cos': return (x, p, E) => Math.cos(a1(x, p, E));
-          case 'tan': return (x, p, E) => Math.tan(a1(x, p, E));
-          case 'pow': return a2 ? (x, p, E) => safePow(a1(x, p, E), a2(x, p, E)) : () => NaN;
-          default: return () => NaN;
-        }
-      }
-      default: return () => NaN;
-    }
-  }
-
-  const fn = compile(ast);
-
-  // Validate: test evaluation
-  try {
-    const testVal = fn(1, new Array(paramNames.length).fill(1), safeExp);
-    if (typeof testVal !== 'number') return null;
-  } catch { return null; }
-
-  // Auto-detect positive parameters: params inside exp() subtrees containing negation
-  // Covers: exp(-b*x), exp(-k*x+c), a*exp(neg(...)), etc.
-  const positiveIdx = [];
-  function hasNegation(node) {
-    if (!node) return false;
-    if (node.op === 'neg') return true;
-    return hasNegation(node.left) || hasNegation(node.right) || hasNegation(node.child)
-      || hasNegation(node.arg1) || hasNegation(node.arg2);
-  }
-  function collectParams(node) {
-    if (!node) return;
-    if (node.op === 'param' && !positiveIdx.includes(node.index)) positiveIdx.push(node.index);
-    collectParams(node.left); collectParams(node.right); collectParams(node.child);
-    collectParams(node.arg1); collectParams(node.arg2);
-  }
-  (function findExpPatterns(node) {
-    if (!node) return;
-    if (node.op === 'func' && node.name === 'exp' && hasNegation(node.arg1)) {
-      // exp contains negation → all params inside are likely rate/decay constants
-      collectParams(node.arg1);
-    }
-    findExpPatterns(node.left); findExpPatterns(node.right); findExpPatterns(node.child);
-    findExpPatterns(node.arg1); findExpPatterns(node.arg2);
-  })(ast);
-
-  const init = new Array(paramNames.length).fill(1);
-  return {
-    family: 'Custom', name, equation: `y = ${expr}`, nParams: paramNames.length,
-    func: (x, p, E) => { try { return fn(x, p, E); } catch { return NaN; } },
-    init, paramNames, positiveIdx
-  };
 }
 
 // ============================================================
@@ -975,18 +1089,11 @@ export default function CurveFitter() {
   const [logY, setLogY] = useState(false);
   const [customExpr, setCustomExpr] = useState("");
   const [customError, setCustomError] = useState(null);
-  const [proModalOpen, setProModalOpen] = useState(false);
   const [copied, setCopied] = useState(null);
-  const [isDemo, setIsDemo] = useState(true);
   const chartRef = useRef(null);
-  const fitGenRef = useRef(0); // generation counter to cancel stale fits
-  const demoInitRef = useRef(false);
-  const handleFitRef = useRef(null);
 
-  const handleParse = useCallback((text, { demo = false } = {}) => {
-    fitGenRef.current++; // cancel any in-flight fit
-    setRawText(text); setError(null); setResults(null); setSelectedModel(null); setFitting(false);
-    if (!demo) setIsDemo(false);
+  const handleParse = useCallback((text) => {
+    setRawText(text); setError(null); setResults(null); setSelectedModel(null);
     const parsed = parseData(text);
     if (parsed) setData(parsed);
     else if (text.trim().length > 0) { setError("Need ≥3 rows with 2 numeric columns."); setData(null); }
@@ -994,91 +1101,50 @@ export default function CurveFitter() {
 
   const handleFile = (e) => {
     const file = e.target.files[0]; if (!file) return;
-    setCustomExpr(""); setCustomError(null); // clear stale custom model
+    setCustomExpr(""); setCustomError(null);
     const reader = new FileReader();
     reader.onload = (ev) => handleParse(ev.target.result);
     reader.readAsText(file);
   };
 
-  // Auto-load demo data on mount
-  useEffect(() => {
-    if (demoInitRef.current) return;
-    demoInitRef.current = true;
-    handleParse(SAMPLES["Enzyme Kinetics"], { demo: true });
-  }, [handleParse]);
-
-  // Auto-fit once demo data is parsed
-  useEffect(() => {
-    if (isDemo && data && !results && !fitting) {
-      handleFitRef.current?.();
-    }
-  }, [isDemo, data, results, fitting]);
-
   const handleFit = useCallback(() => {
     if (!data) return;
-    const gen = ++fitGenRef.current; // capture generation for this fit
     setFitting(true); setFitProgress(0); setError(null); setCustomError(null);
     const models = buildModels(data.xData, data.yData);
 
-    // Inject custom model if provided — smart init + multi-start
+    // === COMPOSER: Detect features → compose models ===
+    try {
+      const features = detectAllFeatures(data.xData, data.yData);
+      const composed = composeModels(features, data.xData, data.yData);
+      // Expand each composed model's initCandidates into separate fit attempts
+      for (const cm of composed) {
+        for (let ci = 0; ci < (cm.initCandidates || [cm.init]).length; ci++) {
+          const init = (cm.initCandidates || [cm.init])[ci];
+          models.push({
+            family: cm.family,
+            name: ci === 0 ? cm.name : `${cm.name} (seed ${ci + 1})`,
+            equation: cm.equation,
+            nParams: cm.nParams,
+            func: cm.func,
+            init,
+            paramNames: cm.paramNames,
+            positiveIdx: cm.positiveIdx,
+            _clampFn: cm.clampFn,
+          });
+        }
+      }
+    } catch (e) {
+      // Composer failure is non-fatal — built-ins still work
+      console.warn('Composer error:', e);
+    }
+
+    // Inject custom model if provided
     if (customExpr.trim()) {
       const custom = parseCustomModel(customExpr);
       if (custom) {
-        const xd = data.xData, yd = data.yData, nd = xd.length;
-        const yMin_ = Math.min(...yd), yMax_ = Math.max(...yd);
-        const yMean_ = yd.reduce((s, y) => s + y, 0) / nd;
-        const yRange_ = yMax_ - yMin_;
-        const xMin_ = Math.min(...xd), xMax_ = Math.max(...xd);
-        const xRange_ = xMax_ - xMin_;
-
-        // Detect trig → estimate frequency via zero-crossing on detrended data
-        const exprLc = customExpr.toLowerCase();
-        const hasTrig = /\b(sin|cos)\b/.test(exprLc);
-        let estFreq = 2 * Math.PI / (xRange_ || 1);
-        if (hasTrig && nd >= 8) {
-          const xMean_ = xd.reduce((s, x) => s + x, 0) / nd;
-          let num = 0, den = 0;
-          for (let i = 0; i < nd; i++) { num += (xd[i] - xMean_) * (yd[i] - yMean_); den += (xd[i] - xMean_) ** 2; }
-          const slope = den > 0 ? num / den : 0;
-          const intercept = yMean_ - slope * xMean_;
-          const detrended = yd.map((y, i) => y - slope * xd[i] - intercept);
-          let crossings = 0;
-          for (let i = 1; i < nd; i++) { if (detrended[i] * detrended[i - 1] < 0) crossings++; }
-          if (crossings > 0) estFreq = Math.PI * crossings / xRange_;
-        }
-
-        // Role-aware initial guesses based on where param appears in expression
-        custom.init = custom.paramNames.map((pName) => {
-          // Frequency: param inside sin(...) or cos(...) parens only
-          const freqPat = new RegExp('(sin|cos)\\s*\\([^)]*\\b' + pName + '\\b');
-          if (freqPat.test(exprLc)) return estFreq;
-          // Amplitude: param multiplied by sin/cos result
-          const ampPat = new RegExp('\\b' + pName + '\\b\\s*\\*\\s*(sin|cos)|(sin|cos)\\s*\\([^)]*\\)\\s*\\*\\s*\\b' + pName + '\\b');
-          if (ampPat.test(exprLc)) return yRange_ / 2;
-          // Slope: param multiplied by x directly
-          const slopePat = new RegExp('\\b' + pName + '\\b\\s*\\*\\s*x|x\\s*\\*\\s*\\b' + pName + '\\b');
-          if (slopePat.test(exprLc)) return xRange_ > 0 ? yRange_ / xRange_ : 1;
-          // Default: offset → yMean
-          return Math.abs(yMean_) > 1e-10 ? yMean_ : 1;
-        });
-
-        // Multi-start: try smart init + 7 random perturbations, keep best
-        let bestInit = custom.init;
-        let bestAicc = Infinity;
-        for (let attempt = 0; attempt < 8; attempt++) {
-          const trialInit = custom.init.map((v, _i) => {
-            if (attempt === 0) return v;
-            return v * Math.pow(10, (Math.random() - 0.5) * 2);
-          });
-          try {
-            const r = levenbergMarquardt(custom.func, xd, yd, trialInit, { positiveIdx: custom.positiveIdx || [] });
-            if (isFinite(r.aicc) && r.aicc < bestAicc && r.finalInvalidCount === 0) {
-              bestAicc = r.aicc;
-              bestInit = trialInit;
-            }
-          } catch {}
-        }
-        custom.init = bestInit;
+        // Smart initial guesses from data
+        const yRange = Math.max(...data.yData) - Math.min(...data.yData);
+        custom.init = custom.init.map(() => yRange > 0 ? yRange * 0.5 : 1);
         models.push(custom);
       } else {
         setCustomError("Could not parse expression. Use: a * exp(-b * x) + c");
@@ -1090,13 +1156,15 @@ export default function CurveFitter() {
     let idx = 0;
 
     const fitNext = () => {
-      // Abort if data changed since fit started
-      if (gen !== fitGenRef.current) { setFitting(false); return; }
       const end = Math.min(idx + 3, total);
       for (let i = idx; i < end; i++) {
         const m = models[i];
         try {
           const r = levenbergMarquardt(m.func, data.xData, data.yData, m.init, { positiveIdx: m.positiveIdx || [] });
+          // Apply composer bounds clamp if available
+          if (m._clampFn && r.params) {
+            r.params = m._clampFn(r.params);
+          }
           // CRITICAL: Disqualify models whose final params produce non-finite predictions
           // This catches cases like Hill with n=251563 where x^n overflows to Infinity
           if (isFinite(r.aicc) && r.finalInvalidCount === 0) fits.push({ ...m, ...r });
@@ -1153,15 +1221,11 @@ export default function CurveFitter() {
     setTimeout(fitNext, 10);
   }, [data, customExpr]);
 
-  // Keep ref in sync so useEffect can call without circular deps
-  handleFitRef.current = handleFit;
-
   const chartDataMemo = useMemo(() => {
-    if (!data) return { dp: [], fp: [], xDomain: undefined };
+    if (!data) return { dp: [], fp: [] };
     const dp = data.xData.map((x, i) => ({ x, y: data.yData[i] }))
       .filter(p => (!logX || p.x > 0) && (!logY || p.y > 0));
     const fp = [];
-    let xDomain;
     if (results && selectedModel !== null && results[selectedModel]) {
       const m = results[selectedModel];
       const hasBands = m.covMatrix && m.s2 && m.tVal;
@@ -1205,50 +1269,24 @@ export default function CurveFitter() {
         } catch { return null; }
       };
 
-      // Fewer points when computing CI bands (2p gradient evals per point)
-      const nPts = (hasBands && showCI) ? 150 : 300;
-
-      const margin = 0.05;
       if (logX) {
         const logMin = Math.log10(xMin), logMax = Math.log10(xMax);
         const logRange = logMax - logMin;
-        for (let i = 0; i <= nPts; i++) {
-          const x = Math.pow(10, logMin - logRange * margin + (logRange * (1 + 2 * margin)) * i / nPts);
+        for (let i = 0; i <= 300; i++) {
+          const x = Math.pow(10, logMin - logRange * 0.05 + (logRange * 1.1) * i / 300);
           const pt = computePoint(x);
           if (pt) fp.push(pt);
         }
       } else {
-        const range = xMax - xMin || 1;
-        const lo = xMin - range * margin;
-        const hi = xMax + range * margin;
-        for (let i = 0; i <= nPts; i++) {
-          const x = lo + (hi - lo) * i / nPts;
+        const range = xMax - xMin;
+        for (let i = 0; i <= 300; i++) {
+          const x = xMin - range * 0.05 + (range * 1.1) * i / 300;
           const pt = computePoint(x);
           if (pt) fp.push(pt);
         }
-        xDomain = [lo, hi];
-      }
-
-      // Clamp fitted curve & bands so extreme model values don't blow up the Y axis
-      if (fp.length > 0 && dp.length > 0) {
-        const yVals = dp.map(p => p.y);
-        const dataYMin = Math.min(...yVals);
-        const dataYMax = Math.max(...yVals);
-        const yRange = (dataYMax - dataYMin) || 1;
-        const clampHi = dataYMax + 3 * yRange;
-        const clampLo = dataYMin - 3 * yRange;
-        for (let i = fp.length - 1; i >= 0; i--) {
-          const pt = fp[i];
-          if (!isFinite(pt.yFit)) { fp.splice(i, 1); continue; }
-          pt.yFit = Math.max(clampLo, Math.min(clampHi, pt.yFit));
-          if (pt.bandUpper != null) {
-            pt.bandUpper = Math.max(clampLo, Math.min(clampHi, pt.bandUpper));
-            pt.bandLower = Math.max(clampLo, Math.min(clampHi, pt.bandLower));
-          }
-        }
       }
     }
-    return { dp, fp, xDomain };
+    return { dp, fp };
   }, [data, results, selectedModel, logX, logY, showCI]);
 
   const residualData = useMemo(() => {
@@ -1262,43 +1300,6 @@ export default function CurveFitter() {
   }, [data, results, selectedModel]);
 
   const fmt = (v) => { if (!isFinite(v)) return "—"; if (Math.abs(v) < 0.001 || Math.abs(v) > 99999) return v.toExponential(4); return v.toPrecision(6); };
-
-  // Nice tick computation for clean axis labels (linear mode only)
-  const niceTicks = (dMin, dMax, count = 5) => {
-    if (!isFinite(dMin) || !isFinite(dMax) || dMin === dMax) {
-      return dMin === dMax && isFinite(dMin) ? [dMin] : [];
-    }
-    const range = dMax - dMin;
-    const rawStep = range / count;
-    const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
-    const residual = rawStep / mag;
-    let niceStep;
-    if (residual < 1.5) niceStep = 1 * mag;
-    else if (residual < 3) niceStep = 2 * mag;
-    else if (residual < 7) niceStep = 5 * mag;
-    else niceStep = 10 * mag;
-    const iLo = Math.floor(dMin / niceStep);
-    const iHi = Math.ceil(dMax / niceStep);
-    const ticks = [];
-    for (let i = iLo; i <= iHi; i++) {
-      ticks.push(parseFloat((i * niceStep).toPrecision(12)));
-    }
-    return ticks;
-  };
-
-  const linearTickFmt = (v) => parseFloat(v.toPrecision(6));
-
-  // Precompute nice ticks for linear axes
-  const axisTicks = useMemo(() => {
-    if (!data) return { x: undefined, y: undefined };
-    const xs = data.xData, ys = data.yData;
-    const xMin = Math.min(...xs), xMax = Math.max(...xs);
-    const yMin = Math.min(...ys), yMax = Math.max(...ys);
-    return {
-      x: logX ? undefined : niceTicks(xMin, xMax, 5),
-      y: logY ? undefined : niceTicks(yMin, yMax, 5),
-    };
-  }, [data, logX, logY]);
 
   const copyParams = (model) => {
     const lines = model.paramNames.map((n, i) => {
@@ -1320,12 +1321,10 @@ export default function CurveFitter() {
     'Freundlich': 'Mathematically equivalent to Power Law (y = Kf·x^(1/n) ≡ a·x^b). Both are shown for scientific naming conventions.',
     'PowerLaw': 'Mathematically equivalent to Freundlich Isotherm. Compare carefully if both rank highly.',
     '5PL': 'Asymmetric extension of 4PL — the g parameter controls asymmetry. When g=1, reduces to 4PL.',
-    'BiExp': 'Two decay components (fast + slow). Parameters (a₁,k₁) and (a₂,k₂) are interchangeable — CIs may be inflated due to this symmetry.',
+    'BiExp': 'Two decay components — useful for systems with fast and slow processes. Requires ≥8 points.',
     'Gompertz': 'Asymmetric sigmoid — unlike Logistic, the inflection point is not at the midpoint.',
     'Lorentzian': 'Cauchy peak profile — heavier tails than Gaussian. Common in spectroscopy (NMR, XRD).',
-    'DampedOsc': 'Damped sinusoidal oscillation — exponential decay envelope × cosine. Common in mechanical vibrations, RLC circuits, and NMR.',
-    'SineTrend': 'Sinusoidal oscillation with linear trend — use for periodic data with drift.',
-    'Custom': 'User-defined equation — fitted with multi-start (8 seeds). Rate params in exp(-k·x) auto-detected as positive.',
+    'Custom': 'User-defined model — initial guesses set automatically from data range.',
   };
 
   const handleExportSVG = () => {
@@ -1358,31 +1357,17 @@ export default function CurveFitter() {
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 p-3" style={{ fontFamily: "'Inter', system-ui, sans-serif" }}>
       <div className="max-w-6xl mx-auto">
-        <header className="mb-5 flex items-start justify-between">
-          <div>
-            <a href="https://calyphi.com" className="no-underline hover:opacity-80 transition-opacity">
-              <h1 className="text-3xl font-bold text-white tracking-tight">
-                <span className="text-blue-400">Curve</span>Fit
-              </h1>
-            </a>
-            <p className="text-gray-400 mt-1 text-xs">
-              25+ scientific models · Custom equations · AICc ranking · Akaike weights · Confidence intervals · Publication-ready · Client-side only
-            </p>
-          </div>
-          <button onClick={() => setProModalOpen(true)}
-            className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-gray-300 border border-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 shrink-0">
-            <span className="text-amber-400">🔒</span> Save Project <span className="text-[10px] font-semibold bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full leading-none">PRO</span>
-          </button>
+        <header className="mb-5">
+          <a href="https://calyphi.com" className="no-underline hover:opacity-80 transition-opacity">
+            <h1 className="text-3xl font-bold text-white tracking-tight">
+              <span className="text-blue-400">Curve</span>Fit
+              <span className="text-xs ml-2 bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full font-medium">v5</span>
+            </h1>
+          </a>
+          <p className="text-gray-400 mt-1 text-xs">
+            35+ scientific models · Auto-composition engine · Custom equations · AICc ranking · Akaike weights · CI bands · Client-side only
+          </p>
         </header>
-
-        {isDemo && results && (
-          <div className="mb-3 flex items-center justify-between rounded-lg bg-blue-600/15 border border-blue-500/30 px-4 py-2.5">
-            <p className="text-sm text-blue-200">
-              Showing demo with enzyme kinetics data — paste your own data to get started.
-            </p>
-            <button onClick={() => setIsDemo(false)} className="text-blue-300 hover:text-white text-xs ml-4 shrink-0 focus:outline-none">✕ Dismiss</button>
-          </div>
-        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
           {/* LEFT — Input & Ranking */}
@@ -1413,12 +1398,12 @@ export default function CurveFitter() {
 
             {/* Custom Model */}
             <section className="bg-gray-900 rounded-lg p-3 border border-gray-800">
-              <h2 className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-2">Custom model <span className="text-gray-400 normal-case font-normal">(optional)</span></h2>
+              <h2 className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-2">Custom model <span className="text-gray-600 normal-case font-normal">(optional)</span></h2>
               <input type="text" value={customExpr} onChange={(e) => { setCustomExpr(e.target.value); setCustomError(null); }}
                 className="w-full bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 border border-gray-700 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                 placeholder="a * exp(-b * x) + c"
                 aria-label="Custom model equation" />
-              <p className="text-xs text-gray-400 mt-1">Use x as variable, a–z as parameters. Functions: exp, log, sin, cos, sqrt, pow. Rate constants in exp(−k·x) are auto-constrained positive.</p>
+              <p className="text-xs text-gray-600 mt-1">Use x for variable, a-z for params. Supports exp, log, sin, cos, sqrt, ^</p>
               {customError && <p className="text-xs text-red-400 mt-1" role="alert">✗ {customError}</p>}
             </section>
 
@@ -1470,7 +1455,7 @@ export default function CurveFitter() {
                           <span className={`font-mono text-xs ${r.adjR2 > 0.99 ? 'text-green-400' : r.adjR2 > 0.95 ? 'text-yellow-400' : r.adjR2 < 0 ? 'text-red-500' : 'text-gray-400'}`}>
                             {r.adjR2 < 0 ? `R²=${r.adjR2.toFixed(2)}` : `R²=${r.adjR2.toFixed(4)}`}
                           </span>
-                          <span className="font-mono text-gray-400 text-xs">{(r.akaikeWeight * 100).toFixed(0)}%</span>
+                          <span className="font-mono text-gray-500 text-xs">{(r.akaikeWeight * 100).toFixed(0)}%</span>
                         </div>
                       </div>
                     </button>
@@ -1502,24 +1487,20 @@ export default function CurveFitter() {
                     <ComposedChart margin={{ top: 10, right: 20, bottom: 40, left: 20 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                       <XAxis dataKey="x" type="number" stroke="#9CA3AF" tick={{ fontSize: 11 }}
-                        scale={logX ? "log" : "auto"}
-                        domain={logX ? (chartDataMemo.xDomain || ['auto', 'auto']) : axisTicks.x ? [axisTicks.x[0], axisTicks.x[axisTicks.x.length - 1]] : ['auto', 'auto']}
-                        ticks={logX ? undefined : axisTicks.x}
-                        allowDataOverflow
-                        tickFormatter={logX ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : linearTickFmt}
+                        scale={logX ? "log" : "auto"} domain={logX ? ['auto', 'auto'] : ['auto', 'auto']}
+                        allowDataOverflow={logX}
+                        tickFormatter={logX ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : undefined}
                         label={{ value: data?.headers[0] || 'x', position: 'bottom', offset: 20, fill: '#9CA3AF', fontSize: 12 }} />
                       <YAxis stroke="#9CA3AF" tick={{ fontSize: 11 }}
-                        scale={logY ? "log" : "auto"}
-                        domain={logY ? ['auto', 'auto'] : axisTicks.y ? [axisTicks.y[0], axisTicks.y[axisTicks.y.length - 1]] : ['auto', 'auto']}
-                        ticks={logY ? undefined : axisTicks.y}
+                        scale={logY ? "log" : "auto"} domain={logY ? ['auto', 'auto'] : ['auto', 'auto']}
                         allowDataOverflow={logY}
-                        tickFormatter={logY ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : linearTickFmt}
+                        tickFormatter={logY ? (v) => v >= 1 ? v.toFixed(0) : v.toPrecision(2) : undefined}
                         label={{ value: data?.headers[1] || 'y', angle: -90, position: 'insideLeft', offset: -5, fill: '#9CA3AF', fontSize: 12 }} />
                       <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: 8, fontSize: 11 }} />
                       {showCI && chartDataMemo.fp.length > 0 && chartDataMemo.fp[0]?.bandUpper != null && (
                         <>
-                          <Line data={chartDataMemo.fp} dataKey="bandUpper" stroke="#3B82F6" strokeWidth={1} strokeDasharray="4 3" dot={false} isAnimationActive={false} opacity={0.35} name="Mean CI upper" />
-                          <Line data={chartDataMemo.fp} dataKey="bandLower" stroke="#3B82F6" strokeWidth={1} strokeDasharray="4 3" dot={false} isAnimationActive={false} opacity={0.35} name="Mean CI lower" />
+                          <Line data={chartDataMemo.fp} dataKey="bandUpper" stroke="#3B82F6" strokeWidth={1} strokeDasharray="4 3" dot={false} isAnimationActive={false} opacity={0.35} name="Upper ≈95%" />
+                          <Line data={chartDataMemo.fp} dataKey="bandLower" stroke="#3B82F6" strokeWidth={1} strokeDasharray="4 3" dot={false} isAnimationActive={false} opacity={0.35} name="Lower ≈95%" />
                         </>
                       )}
                       {chartDataMemo.fp.length > 0 && <Line data={chartDataMemo.fp} dataKey="yFit" stroke="#3B82F6" strokeWidth={2.5} dot={false} name="Fit" isAnimationActive={false} />}
@@ -1544,8 +1525,6 @@ export default function CurveFitter() {
                   {showCI ? "Hide" : "Show"} Uncertainties</button>
                 <button onClick={handleExportSVG} className="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500">Export SVG</button>
                 <button onClick={handleExportCSV} className="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500">Export CSV</button>
-                <button onClick={() => setProModalOpen(true)} className="flex items-center gap-1 text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-gray-300 border border-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"><span className="text-amber-400">🔒</span> Export PDF <span className="text-[10px] font-semibold bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full leading-none">PRO</span></button>
-                <button onClick={() => setProModalOpen(true)} className="flex items-center gap-1 text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-gray-300 border border-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"><span className="text-amber-400">🔒</span> Export PNG 300dpi <span className="text-[10px] font-semibold bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full leading-none">PRO</span></button>
                 <button onClick={() => copyParams(sel)}
                   className="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500">
                   {copied === sel.name ? '✓ Copied!' : 'Copy Params'}
@@ -1559,12 +1538,8 @@ export default function CurveFitter() {
                 <ResponsiveContainer width="100%" height={140}>
                   <ComposedChart data={residualData} margin={{ top: 5, right: 20, bottom: 20, left: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis dataKey="x" type="number" stroke="#9CA3AF" tick={{ fontSize: 10 }}
-                      ticks={logX ? undefined : axisTicks.x}
-                      domain={logX ? ['auto', 'auto'] : axisTicks.x ? [axisTicks.x[0], axisTicks.x[axisTicks.x.length - 1]] : ['auto', 'auto']}
-                      tickFormatter={logX ? undefined : linearTickFmt} />
-                    <YAxis stroke="#9CA3AF" tick={{ fontSize: 10 }}
-                      tickFormatter={linearTickFmt} />
+                    <XAxis dataKey="x" type="number" stroke="#9CA3AF" tick={{ fontSize: 10 }} />
+                    <YAxis stroke="#9CA3AF" tick={{ fontSize: 10 }} />
                     <Scatter dataKey="residual" fill="#EF4444" r={3} />
                     <Line dataKey="zero" stroke="#6B7280" strokeDasharray="5 5" dot={false} isAnimationActive={false} />
                   </ComposedChart>
@@ -1605,17 +1580,11 @@ export default function CurveFitter() {
                 </div>
 
                 {/* Model note */}
-                {(() => {
-                  const note = MODEL_NOTES[sel.family]
-                    || (sel.family.endsWith('_offset') && (MODEL_NOTES[sel.family.replace('_offset', '')]
-                      ? MODEL_NOTES[sel.family.replace('_offset', '')] + ' With vertical offset for non-zero baseline.'
-                      : 'Offset variant — adds vertical shift for data with non-zero baseline.'));
-                  return note ? (
-                    <div className="text-xs text-blue-400/80 bg-blue-500/10 rounded px-2 py-1.5 mb-3">
-                      ℹ {note}
-                    </div>
-                  ) : null;
-                })()}
+                {MODEL_NOTES[sel.family] && (
+                  <div className="text-xs text-blue-400/80 bg-blue-500/10 rounded px-2 py-1.5 mb-3">
+                    ℹ {MODEL_NOTES[sel.family]}
+                  </div>
+                )}
 
                 {/* Parameters with CI */}
                 <div className="overflow-x-auto">
@@ -1639,7 +1608,7 @@ export default function CurveFitter() {
                             </td>
                           )}
                           {showCI && sel.ci95 && (
-                            <td className="py-1.5 text-right font-mono text-gray-400">
+                            <td className="py-1.5 text-right font-mono text-gray-500">
                               {isFinite(sel.ci95[i][0]) ? `[${fmt(sel.ci95[i][0])}, ${fmt(sel.ci95[i][1])}]` : "—"}
                             </td>
                           )}
@@ -1648,8 +1617,8 @@ export default function CurveFitter() {
                     </tbody>
                   </table>
                   {showCI && sel.stdErrors && (
-                    <p className="text-xs text-gray-400 mt-1.5 italic">
-                      Shaded bands show ≈95% confidence interval of the mean fit (analytical delta-method approximation).
+                    <p className="text-xs text-gray-500 mt-1.5 italic">
+                      Approximate CI via local linearization (δ-method on Cov ≈ s²·(JᵀJ)⁻¹).
                       {sel.dof < 8 && <span className="text-yellow-500 not-italic"> Low DOF ({sel.dof}) — uncertainties may be unreliable.</span>}
                     </p>
                   )}
@@ -1680,7 +1649,7 @@ export default function CurveFitter() {
                 {/* Interpretation */}
                 <div className="mt-2 text-xs text-gray-400">
                   {sel.deltaAicc === 0 && `Best model. Akaike weight ${(sel.akaikeWeight * 100).toFixed(0)}% — `}
-                  {sel.deltaAicc === 0 && sel.akaikeWeight > 0.9 && "strong evidence — best among tested models."}
+                  {sel.deltaAicc === 0 && sel.akaikeWeight > 0.9 && "strong evidence this is the correct model."}
                   {sel.deltaAicc === 0 && sel.akaikeWeight <= 0.9 && sel.akaikeWeight > 0.5 && "moderate evidence; consider alternatives."}
                   {sel.deltaAicc === 0 && sel.akaikeWeight <= 0.5 && "weak evidence — multiple models are plausible."}
                   {sel.deltaAicc > 0 && sel.deltaAicc < 2 && "Essentially equivalent to best model (ΔAICc < 2)."}
@@ -1702,13 +1671,11 @@ export default function CurveFitter() {
         </div>
 
         <footer className="mt-6 text-center text-xs text-gray-500">
-          CurveFit · 25+ models + custom equations · Levenberg-Marquardt · AICc + Akaike weights · ≈95% CI + bands · Multi-start · No data leaves your browser
+          CurveFit v5 · 35+ models + auto-composition · Levenberg-Marquardt · AICc + Akaike weights · ≈95% CI + bands · Multi-start · No data leaves your browser
           <span className="mx-2">·</span>
           <a href="https://github.com/calyphi/curvefit" target="_blank" rel="noopener noreferrer" className="text-gray-500 hover:text-gray-300 transition-colors">GitHub</a>
         </footer>
       </div>
-
-      <ProModal open={proModalOpen} onClose={() => setProModalOpen(false)} />
     </div>
   );
 }
